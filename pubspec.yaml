@@ -40,6 +40,9 @@ dependencies:
   permission_handler: ^12.0.1
   tflite_flutter: ^0.12.1
   image: ^4.8.0
+  flutter_bloc: ^9.1.1
+  equatable: ^2.0.8
+  get_it: ^9.2.1
 
 dev_dependencies:
   flutter_test:
@@ -64,7 +67,10 @@ flutter:
   uses-material-design: true
 
   assets:
-    - lib/core/ai_model/
+    # Add your model file next to this line, then run: flutter pub get
+    - assets/bigash_v15_final.tflite
+    - assets/labels.txt
+
   # assets:
   #   - images/a_dot_burr.jpeg
   #   - images/a_dot_ham.jpeg

@@ -1,0 +1,8 @@
+0 background
+1 other
+2 y100
+3 y1000
+4 y200
+5 y250
+6 y50
+7 y500
