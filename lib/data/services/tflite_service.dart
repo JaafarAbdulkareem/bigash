@@ -37,17 +37,6 @@ class TFLiteService {
 
   bool get isModelLoaded => _interpreter != null;
 
-  static const Map<String, String> _labelToArabic = <String, String>{
-    '2_y50': 'خمسون ريال',
-    '3_y100': 'مائة ريال',
-    '4_y200': 'مائتان ريال',
-    '5_y250': 'مائتان وخمسون ريال',
-    '6_y500': 'خمسمائة ريال',
-    '7_y1000': 'ألف ريال',
-    '0_background': 'خلفية',
-    '1_other': 'غير معروف',
-  };
-
   Future<void> initialize() async {
     if (_interpreter == null) {
       try {
@@ -119,15 +108,14 @@ class TFLiteService {
         }
       }
 
-      final String label = _labels[bestIndex];
-      final String displayName = _labelToArabic[label] ?? label;
+      final String label = _labels[bestIndex].trim();
 
       if (!_streamController.isClosed) {
         _lastEmittedAt = DateTime.now();
         _streamController.add(
           TFLiteResult(
             label: label,
-            displayName: displayName,
+            displayName: label,
             confidence: bestConfidence,
           ),
         );

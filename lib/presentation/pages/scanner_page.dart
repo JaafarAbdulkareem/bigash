@@ -8,6 +8,34 @@ import 'package:bigash/presentation/cubits/detection_cubit.dart';
 class ScannerPage extends StatelessWidget {
   const ScannerPage({super.key});
 
+  /// Avoid [CameraPreview] if the controller was disposed (stale state / race).
+  static bool _canShowCameraPreview(CameraController? c, bool isActive) {
+    if (c == null || !isActive) {
+      return false;
+    }
+    try {
+      return c.value.isInitialized;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static String _semanticsLabel(DetectionState s) {
+    if (!s.isActive) {
+      return 'اضغط لتشغيل الكاميرا والتعرف';
+    }
+    switch (s.phase) {
+      case CurrencyDetectionPhase.scanning:
+        return 'مسح نشط مع اهتزاز. اضغط لإيقاف التعرف.';
+      case CurrencyDetectionPhase.lowLight:
+        return 'إضاءة منخفضة، الفلاش مفعّل. اضغط لإيقاف التعرف.';
+      case CurrencyDetectionPhase.success:
+        return 'تم التعرف على العملة. اضغط لإيقاف التعرف.';
+      case CurrencyDetectionPhase.idle:
+        return 'اضغط لإيقاف الكاميرا والتعرف';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -15,14 +43,11 @@ class ScannerPage extends StatelessWidget {
       body: BlocBuilder<DetectionCubit, DetectionState>(
         builder: (BuildContext context, DetectionState mlState) {
           final CameraController? controller = mlState.controller;
-          final bool hasPreview =
-              controller != null && controller.value.isInitialized && mlState.isActive;
+          final bool hasPreview = _canShowCameraPreview(controller, mlState.isActive);
 
           return Semantics(
             button: true,
-            label: mlState.isActive
-                ? 'اضغط لإيقاف الكاميرا والتعرف'
-                : 'اضغط لتشغيل الكاميرا والتعرف',
+            label: _semanticsLabel(mlState),
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: () async {
@@ -32,7 +57,7 @@ class ScannerPage extends StatelessWidget {
               child: Stack(
                 fit: StackFit.expand,
                 children: <Widget>[
-                  if (hasPreview)
+                  if (hasPreview && controller != null)
                     CameraPreview(controller)
                   else
                     const ColoredBox(color: Colors.black),

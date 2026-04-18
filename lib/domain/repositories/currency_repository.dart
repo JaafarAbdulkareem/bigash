@@ -8,6 +8,7 @@ abstract class CurrencyRepository {
   Future<void> initialize();
   Future<void> startCamera();
   Future<void> stopCamera();
+  Future<void> setTorchEnabled(bool enabled);
   CameraController? get cameraController;
   void dispose();
 }

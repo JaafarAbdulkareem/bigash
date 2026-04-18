@@ -37,6 +37,20 @@ class CameraService {
     });
   }
 
+  Future<void> setTorchEnabled(bool enabled) async {
+    final CameraController? controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    try {
+      await controller.setFlashMode(
+        enabled ? FlashMode.torch : FlashMode.off,
+      );
+    } catch (_) {
+      // Torch may be unavailable on some devices.
+    }
+  }
+
   Future<void> disposeCamera() async {
     final CameraController? controller = _cameraController;
     if (controller == null) {

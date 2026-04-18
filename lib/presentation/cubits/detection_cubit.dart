@@ -1,26 +1,37 @@
 import 'dart:async';
 
 import 'package:bigash/data/services/tts_service.dart';
+import 'package:bigash/domain/currency/yemeni_currency_label_mapper.dart';
 import 'package:bigash/domain/entities/currency_entity.dart';
 import 'package:bigash/domain/repositories/currency_repository.dart';
-import 'package:bigash/domain/usecases/recognize_currency_usecase.dart';
 import 'package:camera/camera.dart';
 import 'package:equatable/equatable.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:vibration/vibration.dart';
+
+/// High-level UI / accessibility phase for currency scanning.
+enum CurrencyDetectionPhase {
+  idle,
+  /// Scanning with pulsing vibration (torch follows confidence rules).
+  scanning,
+  /// Low confidence: flashlight on, vibration continues.
+  lowLight,
+  /// Just identified a bill; vibration stopped, TTS will play / playing.
+  success,
+}
 
 class DetectionState extends Equatable {
   final bool isActive;
   final bool isInitialized;
   final String statusText;
   final CameraController? controller;
-  final DetectionVerificationState verification;
+  final CurrencyDetectionPhase phase;
 
   const DetectionState({
     required this.isActive,
     required this.isInitialized,
     required this.statusText,
-    required this.verification,
+    required this.phase,
     this.controller,
   });
 
@@ -29,7 +40,7 @@ class DetectionState extends Equatable {
       isActive: false,
       isInitialized: false,
       statusText: 'اضغط على الشاشة لبدء التعرف',
-      verification: DetectionVerificationState.inconsistent,
+      phase: CurrencyDetectionPhase.idle,
     );
   }
 
@@ -38,14 +49,15 @@ class DetectionState extends Equatable {
     bool? isInitialized,
     String? statusText,
     CameraController? controller,
-    DetectionVerificationState? verification,
+    bool clearCamera = false,
+    CurrencyDetectionPhase? phase,
   }) {
     return DetectionState(
       isActive: isActive ?? this.isActive,
       isInitialized: isInitialized ?? this.isInitialized,
       statusText: statusText ?? this.statusText,
-      controller: controller ?? this.controller,
-      verification: verification ?? this.verification,
+      controller: clearCamera ? null : (controller ?? this.controller),
+      phase: phase ?? this.phase,
     );
   }
 
@@ -55,34 +67,33 @@ class DetectionState extends Equatable {
         isInitialized,
         statusText,
         controller,
-        verification,
+        phase,
       ];
 }
 
-/// Strict verification guard: 5 identical high-confidence frames, cooldown, haptics only when unsure.
 class DetectionCubit extends Cubit<DetectionState> {
   DetectionCubit({
     required CurrencyRepository repository,
     required TTSService ttsService,
-    required RecognizeCurrencyUseCase recognizeCurrencyUseCase,
   })  : _repository = repository,
         _ttsService = ttsService,
-        _recognizeCurrencyUseCase = recognizeCurrencyUseCase,
         super(DetectionState.initial());
 
   final CurrencyRepository _repository;
   final TTSService _ttsService;
-  final RecognizeCurrencyUseCase _recognizeCurrencyUseCase;
 
   StreamSubscription<CurrencyEntity>? _currencySubscription;
+  Timer? _vibrationPulseTimer;
+  Timer? _cooldownTimer;
 
-  final List<DetectionFrame> _resultsBuffer = <DetectionFrame>[];
+  final List<String> _consecutiveResults = <String>[];
   DateTime? _cooldownUntil;
-  DateTime _lastHapticAt =
-      DateTime.now().subtract(const Duration(seconds: 1));
+  bool _canVibrate = false;
+  bool _torchOn = false;
 
+  static const double _confidenceThreshold = 0.85;
+  static const int _requiredConsecutive = 5;
   static const Duration _speechCooldown = Duration(seconds: 3);
-  static const Duration _hapticMinGap = Duration(milliseconds: 400);
 
   bool get _inCooldown =>
       _cooldownUntil != null && DateTime.now().isBefore(_cooldownUntil!);
@@ -101,7 +112,7 @@ class DetectionCubit extends Cubit<DetectionState> {
       emit(
         state.copyWith(
           isActive: false,
-          verification: DetectionVerificationState.inconsistent,
+          phase: CurrencyDetectionPhase.idle,
           statusText:
               'لم يُضف ملف النموذج. ضع ملف tflite في المجلد assets وأعد بناء التطبيق.',
         ),
@@ -112,110 +123,171 @@ class DetectionCubit extends Cubit<DetectionState> {
       return;
     }
 
-    _resultsBuffer.clear();
+    _consecutiveResults.clear();
     _cooldownUntil = null;
+    _cooldownTimer?.cancel();
+    _canVibrate = await Vibration.hasVibrator();
+
     await _repository.startCamera();
+    await _repository.setTorchEnabled(false);
+    _torchOn = false;
 
     emit(
       state.copyWith(
         isActive: true,
-        verification: DetectionVerificationState.inconsistent,
-        statusText: 'جاري التعرف...',
+        phase: CurrencyDetectionPhase.scanning,
+        statusText: 'جاري المسح',
         controller: _repository.cameraController,
       ),
     );
+
+    _startPulsingVibration();
 
     await _currencySubscription?.cancel();
     _currencySubscription =
         _repository.getCurrencyStream().listen(_onCurrencyEntity);
   }
 
+  void _startPulsingVibration() {
+    _vibrationPulseTimer?.cancel();
+    if (!_canVibrate) {
+      return;
+    }
+    _vibrationPulseTimer = Timer.periodic(const Duration(milliseconds: 650), (_) {
+      if (!state.isActive || _inCooldown) {
+        return;
+      }
+      if (state.phase == CurrencyDetectionPhase.success) {
+        return;
+      }
+      unawaited(Vibration.vibrate(duration: 90));
+    });
+  }
+
+  void _stopPulsingVibration() {
+    _vibrationPulseTimer?.cancel();
+    _vibrationPulseTimer = null;
+    unawaited(Vibration.cancel());
+  }
+
+  Future<void> _setTorch(bool on) async {
+    if (_torchOn == on) {
+      return;
+    }
+    _torchOn = on;
+    await _repository.setTorchEnabled(on);
+  }
+
   void _onCurrencyEntity(CurrencyEntity entity) {
-    if (!state.isActive) {
+    if (!state.isActive || _inCooldown) {
       return;
     }
 
-    if (_inCooldown) {
+    final String key = normalizeYemeniClassifierLabel(entity.label);
+
+    if (isIgnoredYemeniCurrencyLabel(key)) {
+      _consecutiveResults.clear();
+      unawaited(_setTorch(false));
+      emit(
+        state.copyWith(
+          phase: CurrencyDetectionPhase.scanning,
+          statusText: 'جاري المسح',
+        ),
+      );
       return;
     }
 
-    final StrictVerificationResult result = _recognizeCurrencyUseCase.applyFrame(
-      buffer: List<DetectionFrame>.from(_resultsBuffer),
-      entity: entity,
-    );
+    if (entity.confidence <= _confidenceThreshold) {
+      _consecutiveResults.clear();
+      unawaited(_setTorch(true));
+      emit(
+        state.copyWith(
+          phase: CurrencyDetectionPhase.lowLight,
+          statusText: 'إضاءة منخفضة — تم تشغيل الفلاش',
+        ),
+      );
+      return;
+    }
 
-    _resultsBuffer
-      ..clear()
-      ..addAll(result.newBuffer);
+    unawaited(_setTorch(false));
+
+    if (_consecutiveResults.isEmpty || _consecutiveResults.last == key) {
+      _consecutiveResults.add(key);
+    } else {
+      _consecutiveResults
+        ..clear()
+        ..add(key);
+    }
+
+    if (_consecutiveResults.length == _requiredConsecutive) {
+      final String spoken = entity.displayName;
+      _consecutiveResults.clear();
+      _cooldownUntil = DateTime.now().add(_speechCooldown);
+      _stopPulsingVibration();
+      unawaited(_setTorch(false));
+      emit(
+        state.copyWith(
+          phase: CurrencyDetectionPhase.success,
+          statusText: spoken,
+        ),
+      );
+      unawaited(_finishSuccessAnnouncement(spoken));
+      return;
+    }
 
     emit(
       state.copyWith(
-        verification: result.verificationState,
-        statusText: result.statusHint ??
-            _defaultStatusFor(result.verificationState),
+        phase: CurrencyDetectionPhase.scanning,
+        statusText:
+            'جاري التحقق ${_consecutiveResults.length} من $_requiredConsecutive',
       ),
     );
-
-    if (result.shouldVibrate) {
-      _maybeHapticFeedback();
-    }
-
-    if (result.speakText != null && result.speakText!.isNotEmpty) {
-      _cooldownUntil = DateTime.now().add(_speechCooldown);
-      final String said = result.speakText!;
-      unawaited(_finishStableAnnouncement(said));
-    }
   }
 
-  String _defaultStatusFor(DetectionVerificationState v) {
-    switch (v) {
-      case DetectionVerificationState.stableMatch:
-        return 'تم التأكد';
-      case DetectionVerificationState.inconsistent:
-        return 'جاري التحقق من الاستقرار';
-      case DetectionVerificationState.lowConfidence:
-        return 'لم يُثبت الإطار بعد';
-    }
-  }
-
-  Future<void> _finishStableAnnouncement(String text) async {
+  Future<void> _finishSuccessAnnouncement(String text) async {
     await _ttsService.speak(text);
-    if (!isClosed && state.isActive) {
+    _cooldownTimer?.cancel();
+    _cooldownTimer = Timer(_speechCooldown, () {
+      _cooldownUntil = null;
+      if (isClosed || !state.isActive) {
+        return;
+      }
+      _startPulsingVibration();
       emit(
         state.copyWith(
-          verification: DetectionVerificationState.stableMatch,
-          statusText: text,
+          phase: CurrencyDetectionPhase.scanning,
+          statusText: 'جاري المسح',
         ),
       );
-    }
-  }
-
-  void _maybeHapticFeedback() {
-    final DateTime now = DateTime.now();
-    if (now.difference(_lastHapticAt) < _hapticMinGap) {
-      return;
-    }
-    _lastHapticAt = now;
-    HapticFeedback.mediumImpact();
+    });
   }
 
   Future<void> stop() async {
     if (!state.isActive) {
       return;
     }
+    _stopPulsingVibration();
+    _cooldownTimer?.cancel();
+    _cooldownTimer = null;
+    _cooldownUntil = null;
     await _currencySubscription?.cancel();
     _currencySubscription = null;
-    _resultsBuffer.clear();
-    _cooldownUntil = null;
-    await _repository.stopCamera();
-    await _ttsService.stop();
+    _consecutiveResults.clear();
+    await _setTorch(false);
+
+    // Drop [CameraPreview] before disposing so buildPreview() never runs on a dead controller.
     emit(
       state.copyWith(
         isActive: false,
-        verification: DetectionVerificationState.inconsistent,
+        phase: CurrencyDetectionPhase.idle,
         statusText: 'متوقف - اضغط على الشاشة للتشغيل',
+        clearCamera: true,
       ),
     );
+    await Future<void>.delayed(Duration.zero);
+
+    await _repository.stopCamera();
+    await _ttsService.stop();
   }
 
   Future<void> toggle() async {
@@ -228,7 +300,20 @@ class DetectionCubit extends Cubit<DetectionState> {
 
   @override
   Future<void> close() async {
+    _stopPulsingVibration();
+    _cooldownTimer?.cancel();
     await _currencySubscription?.cancel();
+    if (!isClosed) {
+      emit(
+        state.copyWith(
+          isActive: false,
+          phase: CurrencyDetectionPhase.idle,
+          clearCamera: true,
+        ),
+      );
+    }
+    await Future<void>.delayed(Duration.zero);
+    await _repository.setTorchEnabled(false);
     _repository.dispose();
     return super.close();
   }
