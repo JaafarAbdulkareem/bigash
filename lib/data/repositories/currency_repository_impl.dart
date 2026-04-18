@@ -23,6 +23,12 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
   bool get isModelLoaded => tfliteService.isModelLoaded;
 
   @override
+  String get diagnostics => tfliteService.diagnostics;
+
+  @override
+  void cycleNormalization() => tfliteService.cycleNormalization();
+
+  @override
   CameraController? get cameraController => cameraService.cameraController;
 
   @override
@@ -34,8 +40,12 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
   Future<void> startCamera() async {
     await cameraService.initialize();
     _cameraSubscription?.cancel();
-    _cameraSubscription = cameraService.imageStream.listen((image) {
-      tfliteService.processImage(image);
+    _cameraSubscription = cameraService.frameStream.listen((frame) {
+      tfliteService.processImage(
+        frame.image,
+        sensorOrientation: frame.sensorOrientation,
+        mirror: frame.isFrontFacing,
+      );
     });
   }
 
@@ -59,6 +69,7 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
         label: normalized,
         displayName: arabicTtsForYemeniBill(normalized),
         confidence: result.confidence,
+        topK: result.topK,
       );
     });
   }

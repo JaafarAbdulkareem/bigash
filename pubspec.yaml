@@ -67,8 +67,7 @@ flutter:
   uses-material-design: true
 
   assets:
-    # Add your model file next to this line, then run: flutter pub get
-    - assets/bigash_v15_final.tflite
+    - assets/bigash_v16.tflite
     - assets/labels.txt
 
   # assets:

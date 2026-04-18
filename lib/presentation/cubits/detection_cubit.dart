@@ -24,6 +24,7 @@ class DetectionState extends Equatable {
   final bool isActive;
   final bool isInitialized;
   final String statusText;
+  final String debugText;
   final CameraController? controller;
   final CurrencyDetectionPhase phase;
 
@@ -32,6 +33,7 @@ class DetectionState extends Equatable {
     required this.isInitialized,
     required this.statusText,
     required this.phase,
+    this.debugText = '',
     this.controller,
   });
 
@@ -48,6 +50,7 @@ class DetectionState extends Equatable {
     bool? isActive,
     bool? isInitialized,
     String? statusText,
+    String? debugText,
     CameraController? controller,
     bool clearCamera = false,
     CurrencyDetectionPhase? phase,
@@ -56,6 +59,7 @@ class DetectionState extends Equatable {
       isActive: isActive ?? this.isActive,
       isInitialized: isInitialized ?? this.isInitialized,
       statusText: statusText ?? this.statusText,
+      debugText: debugText ?? this.debugText,
       controller: clearCamera ? null : (controller ?? this.controller),
       phase: phase ?? this.phase,
     );
@@ -66,6 +70,7 @@ class DetectionState extends Equatable {
         isActive,
         isInitialized,
         statusText,
+        debugText,
         controller,
         phase,
       ];
@@ -86,13 +91,20 @@ class DetectionCubit extends Cubit<DetectionState> {
   Timer? _vibrationPulseTimer;
   Timer? _cooldownTimer;
 
-  final List<String> _consecutiveResults = <String>[];
+  /// Rolling window of recent high-confidence label votes for majority voting.
+  /// This is more forgiving than strict consecutive matching for users who
+  /// cannot hold the phone perfectly still (blind users, hand tremors).
+  final List<String> _voteWindow = <String>[];
   DateTime? _cooldownUntil;
   bool _canVibrate = false;
   bool _torchOn = false;
 
-  static const double _confidenceThreshold = 0.85;
-  static const int _requiredConsecutive = 5;
+  /// Confidence floor: frames below this are treated as "low light / uncertain".
+  static const double _confidenceThreshold = 0.75;
+  /// Number of frames kept in the voting window.
+  static const int _voteWindowSize = 6;
+  /// Required matching votes inside the window to confirm a bill.
+  static const int _requiredMatches = 4;
   static const Duration _speechCooldown = Duration(seconds: 3);
 
   bool get _inCooldown =>
@@ -123,7 +135,7 @@ class DetectionCubit extends Cubit<DetectionState> {
       return;
     }
 
-    _consecutiveResults.clear();
+    _voteWindow.clear();
     _cooldownUntil = null;
     _cooldownTimer?.cancel();
     _canVibrate = await Vibration.hasVibrator();
@@ -178,50 +190,58 @@ class DetectionCubit extends Cubit<DetectionState> {
     await _repository.setTorchEnabled(on);
   }
 
+  String _buildDebugText(CurrencyEntity entity) {
+    if (entity.topK.isEmpty) {
+      return '${entity.label} ${(entity.confidence * 100).toStringAsFixed(0)}%';
+    }
+    return entity.topK
+        .map((e) => '${e.key} ${(e.value * 100).toStringAsFixed(0)}%')
+        .join('  |  ');
+  }
+
   void _onCurrencyEntity(CurrencyEntity entity) {
     if (!state.isActive || _inCooldown) {
       return;
     }
 
+    final String debugText = _buildDebugText(entity);
     final String key = normalizeYemeniClassifierLabel(entity.label);
 
     if (isIgnoredYemeniCurrencyLabel(key)) {
-      _consecutiveResults.clear();
+      // Non-currency frame — push it into the window too, so a bill must
+      // *outvote* the background to be announced.
+      _pushVote(key);
       unawaited(_setTorch(false));
       emit(
         state.copyWith(
           phase: CurrencyDetectionPhase.scanning,
           statusText: 'جاري المسح',
+          debugText: debugText,
         ),
       );
       return;
     }
 
     if (entity.confidence <= _confidenceThreshold) {
-      _consecutiveResults.clear();
+      // Low-confidence frames don't vote; turn on torch to help.
       unawaited(_setTorch(true));
       emit(
         state.copyWith(
           phase: CurrencyDetectionPhase.lowLight,
           statusText: 'إضاءة منخفضة — تم تشغيل الفلاش',
+          debugText: debugText,
         ),
       );
       return;
     }
 
     unawaited(_setTorch(false));
+    _pushVote(key);
 
-    if (_consecutiveResults.isEmpty || _consecutiveResults.last == key) {
-      _consecutiveResults.add(key);
-    } else {
-      _consecutiveResults
-        ..clear()
-        ..add(key);
-    }
-
-    if (_consecutiveResults.length == _requiredConsecutive) {
+    final String? winner = _majorityWinner();
+    if (winner != null && winner == key) {
       final String spoken = entity.displayName;
-      _consecutiveResults.clear();
+      _voteWindow.clear();
       _cooldownUntil = DateTime.now().add(_speechCooldown);
       _stopPulsingVibration();
       unawaited(_setTorch(false));
@@ -229,19 +249,58 @@ class DetectionCubit extends Cubit<DetectionState> {
         state.copyWith(
           phase: CurrencyDetectionPhase.success,
           statusText: spoken,
+          debugText: debugText,
         ),
       );
       unawaited(_finishSuccessAnnouncement(spoken));
       return;
     }
 
+    final int matches = _voteWindow.where((v) => v == key).length;
     emit(
       state.copyWith(
         phase: CurrencyDetectionPhase.scanning,
-        statusText:
-            'جاري التحقق ${_consecutiveResults.length} من $_requiredConsecutive',
+        statusText: 'جاري التحقق $matches من $_requiredMatches',
+        debugText: debugText,
       ),
     );
+  }
+
+  void _pushVote(String label) {
+    _voteWindow.add(label);
+    if (_voteWindow.length > _voteWindowSize) {
+      _voteWindow.removeAt(0);
+    }
+  }
+
+  /// Returns the label that appears at least [_requiredMatches] times in the
+  /// current voting window, or null if no label reaches the threshold.
+  String? _majorityWinner() {
+    if (_voteWindow.length < _requiredMatches) {
+      return null;
+    }
+    final Map<String, int> counts = <String, int>{};
+    for (final String label in _voteWindow) {
+      counts[label] = (counts[label] ?? 0) + 1;
+    }
+    String? best;
+    int bestCount = 0;
+    counts.forEach((String label, int count) {
+      if (count > bestCount) {
+        bestCount = count;
+        best = label;
+      }
+    });
+    if (bestCount >= _requiredMatches) {
+      return best;
+    }
+    return null;
+  }
+
+  Future<void> cycleNormalization() async {
+    _repository.cycleNormalization();
+    _voteWindow.clear();
+    await _ttsService.speak('تم تغيير وضع المعالجة: ${_repository.diagnostics}');
   }
 
   Future<void> _finishSuccessAnnouncement(String text) async {
@@ -272,7 +331,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     _cooldownUntil = null;
     await _currencySubscription?.cancel();
     _currencySubscription = null;
-    _consecutiveResults.clear();
+    _voteWindow.clear();
     await _setTorch(false);
 
     // Drop [CameraPreview] before disposing so buildPreview() never runs on a dead controller.

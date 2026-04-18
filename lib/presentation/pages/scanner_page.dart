@@ -22,11 +22,11 @@ class ScannerPage extends StatelessWidget {
 
   static String _semanticsLabel(DetectionState s) {
     if (!s.isActive) {
-      return 'اضغط لتشغيل الكاميرا والتعرف';
+      return 'اضغط لتشغيل الكاميرا والتعرف. اضغط مطوّلًا لتغيير وضع المعالجة.';
     }
     switch (s.phase) {
       case CurrencyDetectionPhase.scanning:
-        return 'مسح نشط مع اهتزاز. اضغط لإيقاف التعرف.';
+        return 'مسح نشط مع اهتزاز. اضغط لإيقاف التعرف. اضغط مطوّلًا لتغيير وضع المعالجة.';
       case CurrencyDetectionPhase.lowLight:
         return 'إضاءة منخفضة، الفلاش مفعّل. اضغط لإيقاف التعرف.';
       case CurrencyDetectionPhase.success:
@@ -54,6 +54,9 @@ class ScannerPage extends StatelessWidget {
                 context.read<CameraToggleCubit>().toggle();
                 await context.read<DetectionCubit>().toggle();
               },
+              onLongPress: () async {
+                await context.read<DetectionCubit>().cycleNormalization();
+              },
               child: Stack(
                 fit: StackFit.expand,
                 children: <Widget>[
@@ -61,6 +64,24 @@ class ScannerPage extends StatelessWidget {
                     CameraPreview(controller)
                   else
                     const ColoredBox(color: Colors.black),
+                  if (mlState.isActive && mlState.debugText.isNotEmpty)
+                    Align(
+                      alignment: Alignment.topCenter,
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.fromLTRB(12, 48, 12, 12),
+                        color: Colors.black.withValues(alpha: 0.55),
+                        child: Text(
+                          mlState.debugText,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.cyanAccent,
+                            fontSize: 16,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ),
+                    ),
                   Align(
                     alignment: Alignment.bottomCenter,
                     child: Container(

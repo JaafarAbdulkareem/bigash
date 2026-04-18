@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
@@ -11,24 +12,59 @@ class TFLiteResult {
   final String label;
   final String displayName;
   final double confidence;
+  final List<MapEntry<String, double>> topK;
 
   const TFLiteResult({
     required this.label,
     required this.displayName,
     required this.confidence,
+    this.topK = const <MapEntry<String, double>>[],
   });
 }
 
-class TFLiteService {
-  static const String modelAssetPath = 'assets/bigash_v15_final.tflite';
+/// Normalization mode must match how the model was trained.
+/// - [raw]     : pass raw [0, 255] as float32 (model has preprocess_input layer inside — Bigash v16+)
+/// - [signed]  : (x - 127.5) / 127.5  -> [-1, 1]  (MobileNetV1/V2 without internal preprocess layer)
+/// - [unsigned]: x / 255                -> [ 0, 1]  (some custom models)
+/// - [imageNet]: (x/255 - mean) / std            (MobileNetV3, EfficientNet)
+enum NormalizationMode { raw, signed, unsigned, imageNet }
 
-  /// Target ~6–7 FPS inference (between 5–10 Hz) to avoid chatty ML output.
-  static const Duration _minFrameInterval = Duration(milliseconds: 150);
+class TFLiteService {
+  static const String modelAssetPath = 'assets/bigash_v16.tflite';
+
+  static const Duration _minFrameInterval = Duration(milliseconds: 200);
+
+  /// Default for Bigash v16+: the model has a `preprocess_input` layer inside,
+  /// so we must pass raw [0, 255] float32 pixel values (no Flutter-side math).
+  /// For older models trained without internal preprocessing, use [signed].
+  NormalizationMode normalization = NormalizationMode.raw;
 
   Interpreter? _interpreter;
   List<String> _labels = <String>[];
   bool _isProcessing = false;
   DateTime? _lastEmittedAt;
+
+  int _inputWidth = 224;
+  int _inputHeight = 224;
+  bool _inputIsUint8 = false;
+  double _inputScale = 1.0;
+  int _inputZeroPoint = 0;
+  bool _outputIsUint8 = false;
+  double _outputScale = 1.0;
+  int _outputZeroPoint = 0;
+  int _numClasses = 0;
+
+  String get diagnostics =>
+      'in=${_inputWidth}x$_inputHeight ${_inputIsUint8 ? "uint8" : "float32"} '
+      '${_inputIsUint8 ? "scale=$_inputScale zp=$_inputZeroPoint" : normalization.name} '
+      '/ out=$_numClasses ${_outputIsUint8 ? "uint8" : "float32"}';
+
+  void cycleNormalization() {
+    const modes = NormalizationMode.values;
+    final next = (normalization.index + 1) % modes.length;
+    normalization = modes[next];
+    debugPrint('[TFLite] normalization -> ${normalization.name}');
+  }
 
   final StreamController<TFLiteResult> _streamController =
       StreamController<TFLiteResult>.broadcast();
@@ -41,6 +77,7 @@ class TFLiteService {
     if (_interpreter == null) {
       try {
         _interpreter = await Interpreter.fromAsset(modelAssetPath);
+        _readTensorShapes();
       } on FlutterError catch (e) {
         debugPrint('TFLite model not bundled or load failed: $e');
       } catch (e) {
@@ -61,7 +98,48 @@ class TFLiteService {
     }
   }
 
-  Future<void> processImage(CameraImage image) async {
+  void _readTensorShapes() {
+    final interpreter = _interpreter;
+    if (interpreter == null) return;
+
+    try {
+      final inputTensor = interpreter.getInputTensor(0);
+      final shape = inputTensor.shape; // [1, H, W, 3]
+      if (shape.length == 4) {
+        _inputHeight = shape[1];
+        _inputWidth = shape[2];
+      }
+      _inputIsUint8 = inputTensor.type.toString().toLowerCase().contains('uint8');
+      final inQp = inputTensor.params;
+      _inputScale = inQp.scale == 0 ? 1.0 : inQp.scale;
+      _inputZeroPoint = inQp.zeroPoint;
+
+      final outputTensor = interpreter.getOutputTensor(0);
+      final outShape = outputTensor.shape;
+      _numClasses = outShape.last;
+      _outputIsUint8 = outputTensor.type.toString().toLowerCase().contains('uint8');
+
+      final qp = outputTensor.params;
+      _outputScale = qp.scale == 0 ? 1.0 : qp.scale;
+      _outputZeroPoint = qp.zeroPoint;
+
+      debugPrint(
+        '[TFLite] input=$shape uint8=$_inputIsUint8 inScale=$_inputScale inZp=$_inputZeroPoint, '
+        'output=$outShape uint8=$_outputIsUint8 outScale=$_outputScale outZp=$_outputZeroPoint',
+      );
+    } catch (e) {
+      debugPrint('[TFLite] could not read tensor shape: $e');
+    }
+  }
+
+  /// [sensorOrientation] comes from [CameraDescription.sensorOrientation]
+  /// (0, 90, 180, 270). The raw frame must be rotated by this amount so
+  /// the model sees an upright image, matching its training data.
+  Future<void> processImage(
+    CameraImage image, {
+    int sensorOrientation = 90,
+    bool mirror = false,
+  }) async {
     if (_isProcessing || _interpreter == null || _labels.isEmpty) {
       return;
     }
@@ -74,41 +152,81 @@ class TFLiteService {
 
     _isProcessing = true;
     try {
-      final img.Image? converted = _convertCameraImage(image);
-      if (converted == null) {
+      img.Image? frame = _convertCameraImage(image);
+      if (frame == null) {
         return;
       }
 
-      final img.Image resized = img.copyResize(converted, width: 224, height: 224);
-      final Float32List inputBytes = Float32List(1 * 224 * 224 * 3);
-
-      int pixelIndex = 0;
-      for (int y = 0; y < 224; y++) {
-        for (int x = 0; x < 224; x++) {
-          final img.Pixel pixel = resized.getPixel(x, y);
-          inputBytes[pixelIndex++] = pixel.r / 255.0;
-          inputBytes[pixelIndex++] = pixel.g / 255.0;
-          inputBytes[pixelIndex++] = pixel.b / 255.0;
-        }
+      // 1) Rotate to upright.
+      if (sensorOrientation != 0) {
+        frame = img.copyRotate(frame, angle: sensorOrientation);
+      }
+      if (mirror) {
+        frame = img.flipHorizontal(frame);
       }
 
-      final Object input = inputBytes.reshape(<int>[1, 224, 224, 3]);
-      final List<List<double>> output = <List<double>>[
-        List<double>.filled(_labels.length, 0.0),
-      ];
+      // 2) Center-crop to square (preserve aspect ratio).
+      final int side = math.min(frame.width, frame.height);
+      final int offX = (frame.width - side) ~/ 2;
+      final int offY = (frame.height - side) ~/ 2;
+      final img.Image cropped = img.copyCrop(
+        frame,
+        x: offX,
+        y: offY,
+        width: side,
+        height: side,
+      );
 
-      _interpreter!.run(input, output);
+      // 3) Resize to model input.
+      final img.Image resized = img.copyResize(
+        cropped,
+        width: _inputWidth,
+        height: _inputHeight,
+      );
 
-      int bestIndex = 0;
-      double bestConfidence = output[0][0];
-      for (int i = 1; i < output[0].length; i++) {
-        if (output[0][i] > bestConfidence) {
-          bestConfidence = output[0][i];
-          bestIndex = i;
-        }
+      final Object input = _buildInputTensor(resized);
+
+      // 4) Run inference with correct output container for dtype.
+      List<double> probs;
+      if (_outputIsUint8) {
+        final output = List.generate(
+          1,
+          (_) => List<int>.filled(_numClasses, 0),
+        );
+        _interpreter!.run(input, output);
+        probs = output[0]
+            .map<double>(
+              (int q) => (q - _outputZeroPoint) * _outputScale,
+            )
+            .toList();
+      } else {
+        final output = List.generate(
+          1,
+          (_) => List<double>.filled(_numClasses, 0.0),
+        );
+        _interpreter!.run(input, output);
+        probs = List<double>.from(output[0]);
       }
 
+      // 5) If outputs look like logits (not in [0,1]), apply softmax.
+      probs = _maybeSoftmax(probs);
+
+      final int n = math.min(probs.length, _labels.length);
+      final indices = List<int>.generate(n, (i) => i)
+        ..sort((a, b) => probs[b].compareTo(probs[a]));
+
+      final int bestIndex = indices.first;
+      final double bestConfidence = probs[bestIndex];
       final String label = _labels[bestIndex].trim();
+
+      final topK = <MapEntry<String, double>>[];
+      for (int i = 0; i < math.min(3, indices.length); i++) {
+        topK.add(MapEntry(_labels[indices[i]].trim(), probs[indices[i]]));
+      }
+      debugPrint(
+        '[TFLite] ${normalization.name} top3='
+        '${topK.map((e) => "${e.key}=${e.value.toStringAsFixed(2)}").join(", ")}',
+      );
 
       if (!_streamController.isClosed) {
         _lastEmittedAt = DateTime.now();
@@ -117,12 +235,128 @@ class TFLiteService {
             label: label,
             displayName: label,
             confidence: bestConfidence,
+            topK: topK,
           ),
         );
       }
+    } catch (e, st) {
+      debugPrint('[TFLite] inference failed: $e\n$st');
     } finally {
       _isProcessing = false;
     }
+  }
+
+  Object _buildInputTensor(img.Image src) {
+    final int w = src.width;
+    final int h = src.height;
+
+    if (_inputIsUint8) {
+      final Uint8List bytes = Uint8List(1 * h * w * 3);
+      int i = 0;
+      // Quantized models: quantized = real_value / scale + zero_point.
+      // For models trained on [-1,1] with typical scale=1/127.5 zp=128,
+      // this reduces to pixel (since real=(p-127.5)/127.5 -> q=p). So for
+      // the common case we can write raw pixels; otherwise we apply the
+      // signed normalization then quantize explicitly.
+      final bool useSigned = normalization == NormalizationMode.signed;
+      for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+          final img.Pixel p = src.getPixel(x, y);
+          if (useSigned) {
+            final double rn = (p.r - 127.5) / 127.5;
+            final double gn = (p.g - 127.5) / 127.5;
+            final double bn = (p.b - 127.5) / 127.5;
+            bytes[i++] = (rn / _inputScale + _inputZeroPoint).round().clamp(0, 255);
+            bytes[i++] = (gn / _inputScale + _inputZeroPoint).round().clamp(0, 255);
+            bytes[i++] = (bn / _inputScale + _inputZeroPoint).round().clamp(0, 255);
+          } else {
+            bytes[i++] = p.r.toInt();
+            bytes[i++] = p.g.toInt();
+            bytes[i++] = p.b.toInt();
+          }
+        }
+      }
+      return bytes.reshape(<int>[1, h, w, 3]);
+    }
+
+    final Float32List bytes = Float32List(1 * h * w * 3);
+    int i = 0;
+    switch (normalization) {
+      case NormalizationMode.raw:
+        for (int y = 0; y < h; y++) {
+          for (int x = 0; x < w; x++) {
+            final img.Pixel p = src.getPixel(x, y);
+            bytes[i++] = p.r.toDouble();
+            bytes[i++] = p.g.toDouble();
+            bytes[i++] = p.b.toDouble();
+          }
+        }
+        break;
+      case NormalizationMode.signed:
+        for (int y = 0; y < h; y++) {
+          for (int x = 0; x < w; x++) {
+            final img.Pixel p = src.getPixel(x, y);
+            bytes[i++] = (p.r - 127.5) / 127.5;
+            bytes[i++] = (p.g - 127.5) / 127.5;
+            bytes[i++] = (p.b - 127.5) / 127.5;
+          }
+        }
+        break;
+      case NormalizationMode.unsigned:
+        for (int y = 0; y < h; y++) {
+          for (int x = 0; x < w; x++) {
+            final img.Pixel p = src.getPixel(x, y);
+            bytes[i++] = p.r / 255.0;
+            bytes[i++] = p.g / 255.0;
+            bytes[i++] = p.b / 255.0;
+          }
+        }
+        break;
+      case NormalizationMode.imageNet:
+        const double rMean = 0.485, gMean = 0.456, bMean = 0.406;
+        const double rStd = 0.229, gStd = 0.224, bStd = 0.225;
+        for (int y = 0; y < h; y++) {
+          for (int x = 0; x < w; x++) {
+            final img.Pixel p = src.getPixel(x, y);
+            bytes[i++] = (p.r / 255.0 - rMean) / rStd;
+            bytes[i++] = (p.g / 255.0 - gMean) / gStd;
+            bytes[i++] = (p.b / 255.0 - bMean) / bStd;
+          }
+        }
+        break;
+    }
+    return bytes.reshape(<int>[1, h, w, 3]);
+  }
+
+  List<double> _maybeSoftmax(List<double> values) {
+    double sum = 0;
+    bool looksProb = true;
+    for (final v in values) {
+      sum += v;
+      if (v < -0.01 || v > 1.01) {
+        looksProb = false;
+      }
+    }
+    if (looksProb && (sum > 0.9 && sum < 1.1)) {
+      return values;
+    }
+    // Numerically stable softmax.
+    double maxV = values[0];
+    for (final v in values) {
+      if (v > maxV) maxV = v;
+    }
+    double denom = 0;
+    final exps = List<double>.filled(values.length, 0);
+    for (int i = 0; i < values.length; i++) {
+      final e = math.exp(values[i] - maxV);
+      exps[i] = e;
+      denom += e;
+    }
+    if (denom == 0) return values;
+    for (int i = 0; i < exps.length; i++) {
+      exps[i] /= denom;
+    }
+    return exps;
   }
 
   img.Image? _convertCameraImage(CameraImage image) {
@@ -143,8 +377,14 @@ class TFLiteService {
   img.Image _convertYUV420(CameraImage image) {
     final int width = image.width;
     final int height = image.height;
+    final int yRowStride = image.planes[0].bytesPerRow;
     final int uvRowStride = image.planes[1].bytesPerRow;
     final int uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
+
+    final Uint8List yPlane = image.planes[0].bytes;
+    final Uint8List uPlane = image.planes[1].bytes;
+    final Uint8List vPlane = image.planes[2].bytes;
+
     final img.Image rgbImage = img.Image(width: width, height: height);
 
     for (int y = 0; y < height; y++) {
@@ -152,24 +392,26 @@ class TFLiteService {
       for (int x = 0; x < width; x++) {
         final int uvCol = x >> 1;
         final int uvIndex = (uvRow * uvRowStride) + (uvCol * uvPixelStride);
-        final int yIndex = y * image.planes[0].bytesPerRow + x;
+        final int yIndex = y * yRowStride + x;
 
-        if (yIndex >= image.planes[0].bytes.length ||
-            uvIndex >= image.planes[1].bytes.length ||
-            uvIndex >= image.planes[2].bytes.length) {
+        if (yIndex >= yPlane.length ||
+            uvIndex >= uPlane.length ||
+            uvIndex >= vPlane.length) {
           continue;
         }
 
-        final int yp = image.planes[0].bytes[yIndex];
-        final int up = image.planes[1].bytes[uvIndex];
-        final int vp = image.planes[2].bytes[uvIndex];
+        final int yp = yPlane[yIndex];
+        final int up = uPlane[uvIndex] - 128;
+        final int vp = vPlane[uvIndex] - 128;
 
-        final int r = (yp + vp * 1436 / 1024 - 179).round().clamp(0, 255);
-        final int g =
-            (yp - up * 46549 / 131072 + 44 - vp * 93604 / 131072 + 91)
-                .round()
-                .clamp(0, 255);
-        final int b = (yp + up * 1814 / 1024 - 227).round().clamp(0, 255);
+        // BT.601 YUV -> RGB.
+        int r = (yp + 1.402 * vp).round();
+        int g = (yp - 0.344136 * up - 0.714136 * vp).round();
+        int b = (yp + 1.772 * up).round();
+
+        r = r.clamp(0, 255);
+        g = g.clamp(0, 255);
+        b = b.clamp(0, 255);
 
         rgbImage.setPixelRgb(x, y, r, g, b);
       }
