@@ -99,12 +99,17 @@ class DetectionCubit extends Cubit<DetectionState> {
   bool _canVibrate = false;
   bool _torchOn = false;
 
-  /// Confidence floor: frames below this are treated as "low light / uncertain".
-  static const double _confidenceThreshold = 0.75;
-  /// Number of frames kept in the voting window.
-  static const int _voteWindowSize = 6;
-  /// Required matching votes inside the window to confirm a bill.
-  static const int _requiredMatches = 4;
+  /// Minimum confidence for a currency-class frame to count as a vote.
+  static const double _currencyThreshold = 0.55;
+  /// Minimum confidence for an "other" frame to count as a vote.
+  /// Higher than currency so ambiguous frames (other=40%, y500=30%) don't
+  /// lock the app into permanent silence — instead they trigger torch and
+  /// give the user a chance to reposition the bill.
+  static const double _otherThreshold = 0.75;
+  /// Number of recent frames we remember for majority voting.
+  static const int _voteWindowSize = 10;
+  /// How many of those frames must agree to announce the bill.
+  static const int _requiredMatches = 3;
   static const Duration _speechCooldown = Duration(seconds: 3);
 
   bool get _inCooldown =>
@@ -208,22 +213,33 @@ class DetectionCubit extends Cubit<DetectionState> {
     final String key = normalizeYemeniClassifierLabel(entity.label);
 
     if (isIgnoredYemeniCurrencyLabel(key)) {
-      // Non-currency frame — push it into the window too, so a bill must
-      // *outvote* the background to be announced.
-      _pushVote(key);
-      unawaited(_setTorch(false));
-      emit(
-        state.copyWith(
-          phase: CurrencyDetectionPhase.scanning,
-          statusText: 'جاري المسح',
-          debugText: debugText,
-        ),
-      );
+      // Only a high-confidence "other" counts as a vote. Ambiguous frames
+      // (other=40%, y500=30%) would otherwise lock out currency detection.
+      if (entity.confidence >= _otherThreshold) {
+        _pushVote(key);
+        unawaited(_setTorch(false));
+        emit(
+          state.copyWith(
+            phase: CurrencyDetectionPhase.scanning,
+            statusText: 'جاري المسح',
+            debugText: debugText,
+          ),
+        );
+      } else {
+        unawaited(_setTorch(true));
+        emit(
+          state.copyWith(
+            phase: CurrencyDetectionPhase.lowLight,
+            statusText: 'غير واضح — حاول تغيير الزاوية',
+            debugText: debugText,
+          ),
+        );
+      }
       return;
     }
 
-    if (entity.confidence <= _confidenceThreshold) {
-      // Low-confidence frames don't vote; turn on torch to help.
+    if (entity.confidence <= _currencyThreshold) {
+      // Low-confidence currency frames don't vote; turn on torch to help.
       unawaited(_setTorch(true));
       emit(
         state.copyWith(

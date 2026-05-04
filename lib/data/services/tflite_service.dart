@@ -30,9 +30,9 @@ class TFLiteResult {
 enum NormalizationMode { raw, signed, unsigned, imageNet }
 
 class TFLiteService {
-  static const String modelAssetPath = 'assets/bigash_v16.tflite';
+  static const String modelAssetPath = 'assets/bigash_v17.tflite';
 
-  static const Duration _minFrameInterval = Duration(milliseconds: 200);
+  static const Duration _minFrameInterval = Duration(milliseconds: 100);
 
   /// Default for Bigash v16+: the model has a `preprocess_input` layer inside,
   /// so we must pass raw [0, 255] float32 pixel values (no Flutter-side math).
