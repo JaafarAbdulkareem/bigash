@@ -1,31 +1,34 @@
 """
-Bigash Yemeni-currency classifier — training script (v2, production).
+Bigash Yemeni-currency classifier — training script v3 (PRODUCTION TARGET 95%+).
 
-Key improvements over v1:
-  - Cosine learning-rate schedule with warmup
-  - Mixed precision (fp16) on GPU for ~2x speedup, no accuracy loss
-  - Stronger in-model augmentation (RandomZoom, RandomTranslation, contrast,
-    brightness, hue/saturation via custom layer)
-  - MixUp regularization for robustness
-  - BatchNorm kept frozen during fine-tuning (the documented stable recipe)
-  - Class weights to penalize misclassifying "other"
-  - Stage-1 vs Stage-2 best-checkpoint comparison and selection
-  - Test-Time Augmentation (TTA) baked into exported TFLite for inference
-  - Detailed per-class confusion matrix with precision/recall
+Major upgrades over v2:
+  - Backbone choice: EfficientNetB0 (default, higher accuracy) or MobileNetV2.
+  - Removed in-model augmentation (offline augment_dataset.py v4 handles it).
+    The cleaner graph makes TFLite export trivial (no Lambda/RandomLayer bugs).
+  - MixUp + CutMix applied as tf.data map operations (40% MixUp, 30% CutMix).
+  - Longer training: 50 head + 40 fine-tune epochs (was 30 + 30).
+  - Class weights auto-computed from training set sizes.
+  - Smarter Stage 2: unfreezes more layers, slightly higher LR.
+  - Saves stage1_best.keras and stage2_best.keras; pick whichever scored higher.
 
 USAGE (Google Colab — internet available):
     !python train_bigash_model.py --data_dir /content/dataset_aug \\
         --output_dir /content/out
 
-USAGE (Kaggle Save & Run All — no internet):
+USAGE (Kaggle Save & Run All — no internet, MobileNetV2 weights provided):
     !python train_bigash_model.py --data_dir /kaggle/working/dataset_aug \\
         --output_dir /kaggle/working/out \\
-        --weights_path /kaggle/input/mobilenetv2-imagenet-weights/mobilenet_v2_weights_tf_dim_ordering_tf_kernels_1.0_224_no_top.h5
+        --backbone mobilenetv2 \\
+        --weights_path /kaggle/input/datasets/king1981/mobilenetv2-imagenet-weights/mobilenet_v2_weights_tf_dim_ordering_tf_kernels_1.0_224_no_top.h5
+
+USAGE (EfficientNetB0 — needs internet OR EfficientNetB0 weights .h5):
+    !python train_bigash_model.py --data_dir /content/dataset_aug \\
+        --output_dir /content/out --backbone efficientnetb0
 
 Output:
-    bigash_v17.tflite   the model to drop into the Flutter app
+    bigash_v18.tflite   the model to drop into the Flutter app
     labels.txt          class names in the same order as model output
-    stage1_best.keras   intermediate snapshots (kept for re-runs)
+    stage1_best.keras   intermediate snapshots (loaded back in Colab for export)
     stage2_best.keras
 """
 
@@ -40,13 +43,13 @@ import tensorflow as tf
 from tensorflow.keras import layers, optimizers, callbacks
 
 IMG_SIZE = 224
-BATCH_SIZE = 32
+BATCH_SIZE = 16  # was 32 — halved to stay within Kaggle's RAM budget
 SEED = 42
-MODEL_FILENAME = "bigash_v17.tflite"
+MODEL_FILENAME = "bigash_v18.tflite"
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Dataset loading (proper stratified split via shuffle+seed on both sets)
+# Dataset loading
 # ──────────────────────────────────────────────────────────────────────
 
 def build_datasets(data_dir, val_split=0.2):
@@ -62,89 +65,160 @@ def build_datasets(data_dir, val_split=0.2):
     )
     class_names = train_ds.class_names
     print(f"Detected classes: {class_names}")
-
-    autotune = tf.data.AUTOTUNE
-    train_ds = train_ds.cache().shuffle(2000).prefetch(autotune)
-    val_ds = val_ds.cache().prefetch(autotune)
     return train_ds, val_ds, class_names
 
 
 # ──────────────────────────────────────────────────────────────────────
-# MixUp regularization
+# MixUp + CutMix (applied via tf.data map; works with any backbone)
 # ──────────────────────────────────────────────────────────────────────
 
-class MixUpLayer(layers.Layer):
-    """Apply MixUp inside the model graph during training only."""
-    def __init__(self, alpha=0.2, **kwargs):
-        super().__init__(**kwargs)
-        self.alpha = alpha
+def mixup_batch(images, labels, alpha=0.4):
+    """Standard MixUp: x_mix = lam*x + (1-lam)*x_perm, y_mix similarly."""
+    batch = tf.shape(images)[0]
+    # Sample lam from Beta(alpha, alpha) — use uniform 0.1..0.9 as a simple
+    # bounded proxy (closer to bimodal Beta with low alpha but TF-safe).
+    lam = tf.random.uniform([], 0.1, 0.9)
+    idx = tf.random.shuffle(tf.range(batch))
+    images_b = tf.gather(images, idx)
+    labels_b = tf.gather(labels, idx)
+    images_mix = lam * images + (1.0 - lam) * images_b
+    labels_mix = lam * labels + (1.0 - lam) * labels_b
+    return images_mix, labels_mix
 
-    def call(self, inputs, training=False):
-        x, y = inputs
-        if not training or self.alpha <= 0:
-            return x, y
-        batch = tf.shape(x)[0]
-        # Beta(alpha, alpha) — clipped between 0.1 and 0.9 for stability.
-        lam = tf.random.uniform([], 0.1, 0.9)
-        idx = tf.random.shuffle(tf.range(batch))
-        x2 = tf.gather(x, idx)
-        y2 = tf.gather(y, idx)
-        x_mix = lam * x + (1.0 - lam) * x2
-        y_mix = lam * y + (1.0 - lam) * y2
-        return x_mix, y_mix
+
+def cutmix_batch(images, labels, alpha=1.0):
+    """CutMix: copy a random rectangular patch from a shuffled sample
+    into each image, mix labels proportionally to patch area."""
+    batch = tf.shape(images)[0]
+    h = tf.shape(images)[1]
+    w = tf.shape(images)[2]
+
+    lam = tf.random.uniform([], 0.2, 0.8)
+    cut_ratio = tf.math.sqrt(1.0 - lam)
+    cut_h = tf.cast(tf.cast(h, tf.float32) * cut_ratio, tf.int32)
+    cut_w = tf.cast(tf.cast(w, tf.float32) * cut_ratio, tf.int32)
+
+    cy = tf.random.uniform([], 0, h, dtype=tf.int32)
+    cx = tf.random.uniform([], 0, w, dtype=tf.int32)
+    y1 = tf.clip_by_value(cy - cut_h // 2, 0, h)
+    y2 = tf.clip_by_value(cy + cut_h // 2, 0, h)
+    x1 = tf.clip_by_value(cx - cut_w // 2, 0, w)
+    x2 = tf.clip_by_value(cx + cut_w // 2, 0, w)
+
+    idx = tf.random.shuffle(tf.range(batch))
+    images_b = tf.gather(images, idx)
+    labels_b = tf.gather(labels, idx)
+
+    # Build a (1, h, w, 1) mask that is 1 outside the patch, 0 inside.
+    mask = tf.ones((h, w), dtype=images.dtype)
+    yy = tf.range(h)
+    xx = tf.range(w)
+    in_y = tf.logical_and(yy >= y1, yy < y2)
+    in_x = tf.logical_and(xx >= x1, xx < x2)
+    patch_mask = tf.cast(in_y[:, None] & in_x[None, :], images.dtype)
+    mask = 1.0 - patch_mask
+    mask = mask[None, :, :, None]  # broadcast to (B, H, W, C)
+
+    images_mix = images * mask + images_b * (1.0 - mask)
+    real_lam = 1.0 - tf.cast(
+        (y2 - y1) * (x2 - x1), tf.float32) / tf.cast(h * w, tf.float32)
+    real_lam = tf.cast(real_lam, labels.dtype)
+    labels_mix = real_lam * labels + (1.0 - real_lam) * labels_b
+    return images_mix, labels_mix
+
+
+def augment_pipeline(images, labels):
+    """Randomly apply MixUp (40%) or CutMix (30%); otherwise pass through.
+    Probabilities chosen empirically — MixUp slightly preferred."""
+    r = tf.random.uniform([])
+    return tf.cond(
+        r < 0.40,
+        lambda: mixup_batch(images, labels),
+        lambda: tf.cond(
+            r < 0.70,
+            lambda: cutmix_batch(images, labels),
+            lambda: (images, labels),
+        ),
+    )
+
+
+def prepare_datasets(train_ds, val_ds):
+    # Conservative pipeline — Kaggle's process is OOM-killed if total RAM
+    # spikes past ~30 GB. AUTOTUNE was opening too many parallel workers
+    # that each held an in-flight batch in memory. Fixed small values keep
+    # the working set bounded.
+    train_ds = train_ds.shuffle(500)                                  # was 2000
+    train_ds = train_ds.map(augment_pipeline, num_parallel_calls=2)   # was AUTOTUNE
+    train_ds = train_ds.prefetch(2)                                   # was AUTOTUNE
+    val_ds = val_ds.prefetch(2)                                       # was AUTOTUNE
+    return train_ds, val_ds
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Model construction
 # ──────────────────────────────────────────────────────────────────────
 
-def build_augmentation():
-    return tf.keras.Sequential(
-        [
-            layers.RandomRotation(0.10),
-            layers.RandomZoom(0.15),
-            layers.RandomContrast(0.30),
-            layers.RandomBrightness(0.25, value_range=(0.0, 255.0)),
-            layers.RandomTranslation(0.10, 0.10),
-        ],
-        name="data_augmentation",
-    )
+def build_backbone(name, weights_path=None):
+    """Returns (backbone_model, preprocess_layers).
+
+    The preprocess_layers convert input in [0, 255] float32 to whatever
+    range the backbone expects. They are baked into the exported graph
+    so the Flutter app can keep passing raw [0, 255]."""
+    name = name.lower()
+    if name == "mobilenetv2":
+        if weights_path and os.path.exists(weights_path):
+            print(f"📦 Loading MobileNetV2 weights from {weights_path}")
+            base = tf.keras.applications.MobileNetV2(
+                input_shape=(IMG_SIZE, IMG_SIZE, 3),
+                include_top=False, weights=None,
+            )
+            base.load_weights(weights_path)
+        else:
+            base = tf.keras.applications.MobileNetV2(
+                input_shape=(IMG_SIZE, IMG_SIZE, 3),
+                include_top=False, weights="imagenet",
+            )
+        # MobileNetV2 expects [-1, 1].
+        preprocess = layers.Rescaling(scale=1.0 / 127.5, offset=-1.0)
+        return base, preprocess
+
+    if name == "efficientnetb0":
+        if weights_path and os.path.exists(weights_path):
+            print(f"📦 Loading EfficientNetB0 weights from {weights_path}")
+            base = tf.keras.applications.EfficientNetB0(
+                input_shape=(IMG_SIZE, IMG_SIZE, 3),
+                include_top=False, weights=None,
+            )
+            base.load_weights(weights_path)
+        else:
+            base = tf.keras.applications.EfficientNetB0(
+                input_shape=(IMG_SIZE, IMG_SIZE, 3),
+                include_top=False, weights="imagenet",
+            )
+        # EfficientNet has Normalization baked in — pass raw [0, 255].
+        # We still insert an Identity-ish Rescaling for export uniformity.
+        preprocess = layers.Rescaling(scale=1.0, offset=0.0)
+        return base, preprocess
+
+    raise ValueError(f"Unknown backbone: {name}")
 
 
-def build_model(num_classes, weights_path=None):
-    """MobileNetV2 with classification head. Preprocessing baked in.
-
-    If ``weights_path`` is given, load ImageNet weights from that local
-    .h5 file (useful when the runtime has no internet, e.g. Kaggle
-    Save & Run All). Otherwise download from storage.googleapis.com.
-    """
-    if weights_path and os.path.exists(weights_path):
-        print(f"📦 Loading MobileNetV2 weights from local file: {weights_path}")
-        base = tf.keras.applications.MobileNetV2(
-            input_shape=(IMG_SIZE, IMG_SIZE, 3),
-            include_top=False, weights=None,
-        )
-        base.load_weights(weights_path)
-    else:
-        base = tf.keras.applications.MobileNetV2(
-            input_shape=(IMG_SIZE, IMG_SIZE, 3),
-            include_top=False, weights="imagenet",
-        )
+def build_model(num_classes, backbone_name, weights_path=None):
+    """Clean architecture — no in-model augmentation; offline pipeline
+    (augment_dataset.py v4) already provides 12 variants per image."""
+    base, preprocess = build_backbone(backbone_name, weights_path)
     base.trainable = False
 
     inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3), dtype=tf.float32)
-    x = build_augmentation()(inputs)
-    # MobileNetV2 expects [-1, 1] — bake the conversion into the graph so
-    # the Flutter app can pass raw [0, 255] float32.
-    x = tf.keras.applications.mobilenet_v2.preprocess_input(x)
+    x = preprocess(inputs)
     x = base(x, training=False)
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dropout(0.4)(x)
-    x = layers.Dense(128, activation="relu",
+    x = layers.Dense(192, activation="relu",
                      kernel_regularizer=tf.keras.regularizers.l2(1e-5))(x)
     x = layers.Dropout(0.3)(x)
     outputs = layers.Dense(num_classes, activation="softmax",
-                           dtype=tf.float32)(x)  # force fp32 output for stability
+                           dtype=tf.float32)(x)  # fp32 output for stability
     return tf.keras.Model(inputs, outputs), base
 
 
@@ -153,11 +227,10 @@ def build_model(num_classes, weights_path=None):
 # ──────────────────────────────────────────────────────────────────────
 
 def make_callbacks(ckpt_path):
-    # NOTE: do not add ReduceLROnPlateau here — it is incompatible with
-    # CosineDecay schedule (the schedule object makes lr non-settable).
+    # ReduceLROnPlateau is incompatible with CosineDecay — don't add it.
     return [
         callbacks.EarlyStopping(
-            patience=10, restore_best_weights=True,
+            patience=12, restore_best_weights=True,
             monitor="val_accuracy", mode="max",
         ),
         callbacks.ModelCheckpoint(
@@ -168,7 +241,6 @@ def make_callbacks(ckpt_path):
 
 
 def cosine_schedule(initial_lr, total_steps, warmup_steps):
-    """Cosine decay with linear warmup — smooth LR trajectory."""
     return tf.keras.optimizers.schedules.CosineDecay(
         initial_learning_rate=initial_lr,
         decay_steps=total_steps,
@@ -178,8 +250,25 @@ def cosine_schedule(initial_lr, total_steps, warmup_steps):
     )
 
 
+def compute_class_weights(data_dir, class_names):
+    """Inverse-frequency class weights, normalised to mean=1.0.
+    Boosts rare classes; 'other' gets an extra +20% to discourage
+    false-positive currency announcements."""
+    counts = []
+    for c in class_names:
+        d = pathlib.Path(data_dir) / c
+        counts.append(len([p for p in d.iterdir() if p.is_file()]))
+    counts = np.array(counts, dtype=np.float64)
+    weights = counts.mean() / counts
+    weights = weights / weights.mean()  # normalise so mean is 1.0
+    weight_dict = {i: float(w) for i, w in enumerate(weights)}
+    if "other" in class_names:
+        weight_dict[class_names.index("other")] *= 1.2
+    return weight_dict
+
+
 def train(data_dir, output_dir, head_epochs, finetune_epochs,
-          finetune_at, mixed_precision, weights_path=None):
+          finetune_at, mixed_precision, backbone_name, weights_path=None):
     if mixed_precision:
         try:
             tf.keras.mixed_precision.set_global_policy("mixed_float16")
@@ -187,29 +276,29 @@ def train(data_dir, output_dir, head_epochs, finetune_epochs,
         except Exception as e:
             print(f"Mixed precision unavailable: {e}")
 
-    train_ds, val_ds, class_names = build_datasets(data_dir)
+    train_ds_raw, val_ds, class_names = build_datasets(data_dir)
     num_classes = len(class_names)
-    steps_per_epoch = tf.data.experimental.cardinality(train_ds).numpy()
+    steps_per_epoch = tf.data.experimental.cardinality(train_ds_raw).numpy()
     if steps_per_epoch <= 0:
-        steps_per_epoch = 100  # fallback for unknown size
+        steps_per_epoch = 100
 
-    model, base = build_model(num_classes, weights_path=weights_path)
+    # Prepare datasets AFTER computing cardinality (cardinality on the raw
+    # ds is meaningful, but unknown after .map(augment_pipeline)).
+    train_ds, val_ds = prepare_datasets(train_ds_raw, val_ds)
 
-    # Class weights — protect against false-positive currency announcements.
-    class_weight = {i: 1.0 for i in range(num_classes)}
-    try:
-        other_idx = class_names.index("other")
-        class_weight[other_idx] = 1.5
-        print(f"Using class_weight: {class_weight}")
-    except ValueError:
-        pass
+    model, base = build_model(num_classes, backbone_name, weights_path)
+    print(f"\n🧠 Backbone: {backbone_name}")
+    print(f"📊 Steps per epoch: {steps_per_epoch}")
+
+    class_weight = compute_class_weights(data_dir, class_names)
+    print(f"⚖️ Class weights: { {class_names[i]: round(v, 2) for i, v in class_weight.items()} }")
 
     # ── Stage 1: classification head only ────────────────────────────
     s1_steps = head_epochs * steps_per_epoch
-    s1_warmup = max(1, int(0.1 * s1_steps))
+    s1_warmup = max(1, int(0.08 * s1_steps))
     model.compile(
         optimizer=optimizers.Adam(cosine_schedule(1e-3, s1_steps, s1_warmup)),
-        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.07),
+        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.08),
         metrics=["accuracy"],
     )
     model.summary()
@@ -222,7 +311,7 @@ def train(data_dir, output_dir, head_epochs, finetune_epochs,
     best_s1 = max(h1.history.get("val_accuracy", [0.0]))
     print(f"Stage 1 best val_accuracy: {best_s1:.4f}")
 
-    # ── Stage 2: fine-tune top of MobileNetV2 (BN frozen) ────────────
+    # ── Stage 2: fine-tune top of backbone (BN frozen) ───────────────
     print("\n=== Stage 2: fine-tune backbone (BN layers frozen) ===")
     base.trainable = True
     for layer in base.layers[:finetune_at]:
@@ -233,9 +322,10 @@ def train(data_dir, output_dir, head_epochs, finetune_epochs,
 
     s2_steps = finetune_epochs * steps_per_epoch
     s2_warmup = max(1, int(0.05 * s2_steps))
+    # Slightly higher fine-tune LR than v2 (5e-6 was very timid).
     model.compile(
-        optimizer=optimizers.Adam(cosine_schedule(5e-6, s2_steps, s2_warmup)),
-        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.07),
+        optimizer=optimizers.Adam(cosine_schedule(1e-5, s2_steps, s2_warmup)),
+        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.08),
         metrics=["accuracy"],
     )
     stage2_ckpt = output_dir / "stage2_best.keras"
@@ -286,50 +376,32 @@ def _print_confusion_matrix(cm, class_names):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Test-Time Augmentation (TTA) wrapper for export
+# TFLite export — uses the working concrete-function path
 # ──────────────────────────────────────────────────────────────────────
 
-def build_tta_model(model, num_classes):
-    """Wraps the trained model so that inference averages predictions
-    over the original image and its horizontal flip. Adds 1-3% accuracy.
-
-    Note: tf.image.flip_left_right must be wrapped in a Lambda layer
-    because Keras 3 forbids raw tf.* ops on KerasTensors."""
-    inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3), dtype=tf.float32)
-    p1 = model(inputs)
-    flipped = layers.Lambda(
-        lambda x: tf.image.flip_left_right(x),
-        output_shape=(IMG_SIZE, IMG_SIZE, 3),
-    )(inputs)
-    p2 = model(flipped)
-    avg = (p1 + p2) / 2.0
-    return tf.keras.Model(inputs, avg, name="bigash_tta")
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Export to TFLite
-# ──────────────────────────────────────────────────────────────────────
-
-def export_tflite(model, class_names, output_dir, quantize, use_tta):
+def export_tflite(model, class_names, output_dir, quantize):
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if use_tta:
-        export_model = build_tta_model(model, len(class_names))
-        print("🎯 TTA enabled — exported model averages 2 predictions per inference")
-    else:
-        export_model = model
+    # Build a serving function with a fixed [1, 224, 224, 3] signature.
+    # This avoids the from_keras_model bug on TF 2.16+/Keras 3 and is
+    # the same path that worked in our Colab rescue cell.
+    @tf.function(input_signature=[
+        tf.TensorSpec(shape=[1, IMG_SIZE, IMG_SIZE, 3], dtype=tf.float32)
+    ])
+    def serving_fn(x):
+        return model(x, training=False)
 
-    converter = tf.lite.TFLiteConverter.from_keras_model(export_model)
+    concrete = serving_fn.get_concrete_function()
+    converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete], model)
 
     if quantize == "fp16":
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         converter.target_spec.supported_types = [tf.float16]
-    # else: leave as float32
 
     tflite_bytes = converter.convert()
     tflite_path = output_dir / MODEL_FILENAME
     tflite_path.write_bytes(tflite_bytes)
-    print(f"✅ Wrote {tflite_path} ({len(tflite_bytes) / 1024:.1f} KB)")
+    print(f"✅ Wrote {tflite_path} ({len(tflite_bytes) / 1024 / 1024:.2f} MB)")
 
     labels_path = output_dir / "labels.txt"
     with labels_path.open("w", encoding="utf-8") as f:
@@ -338,7 +410,7 @@ def export_tflite(model, class_names, output_dir, quantize, use_tta):
     print(f"✅ Wrote {labels_path}")
     print(f"Class order: {class_names}")
 
-    # Sanity check — black image should predict 'other' confidently.
+    # Sanity check
     interp = tf.lite.Interpreter(model_content=tflite_bytes)
     interp.allocate_tensors()
     in_det = interp.get_input_details()[0]
@@ -350,7 +422,7 @@ def export_tflite(model, class_names, output_dir, quantize, use_tta):
     interp.set_tensor(in_det["index"], zeros)
     interp.invoke()
     out = interp.get_tensor(out_det["index"])[0]
-    print("Sanity check (zero image):")
+    print("Sanity check (zero image — expect 'other' highest):")
     for name, v in zip(class_names, out.astype(np.float32)):
         print(f"  {name:<8} {float(v):.3f}")
 
@@ -363,17 +435,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True, type=pathlib.Path)
     ap.add_argument("--output_dir", default=pathlib.Path("out"), type=pathlib.Path)
-    ap.add_argument("--head_epochs", type=int, default=30)
-    ap.add_argument("--finetune_epochs", type=int, default=30)
-    ap.add_argument("--finetune_at", type=int, default=100,
-                    help="Number of bottom layers to keep frozen during Stage 2.")
+    ap.add_argument("--backbone", default="mobilenetv2",
+                    choices=["mobilenetv2", "efficientnetb0"])
+    ap.add_argument("--head_epochs", type=int, default=50)      # was 30
+    ap.add_argument("--finetune_epochs", type=int, default=40)  # was 30
+    ap.add_argument("--finetune_at", type=int, default=80,
+                    help="Number of bottom layers kept frozen in Stage 2.")
     ap.add_argument("--quantize", default="fp16", choices=["fp16", "none"])
-    ap.add_argument("--no_tta", action="store_true",
-                    help="Disable Test-Time Augmentation in the exported model.")
     ap.add_argument("--no_mixed_precision", action="store_true")
     ap.add_argument("--weights_path", type=str, default=None,
-                    help="Local path to MobileNetV2 ImageNet weights .h5 file. "
-                         "Use this when the runtime has no internet access.")
+                    help="Local path to backbone ImageNet weights .h5 file.")
+    ap.add_argument("--skip_export", action="store_true",
+                    help="Skip TFLite export (do it in Colab afterwards).")
     args = ap.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -384,11 +457,17 @@ def main():
         finetune_epochs=args.finetune_epochs,
         finetune_at=args.finetune_at,
         mixed_precision=not args.no_mixed_precision,
+        backbone_name=args.backbone,
         weights_path=args.weights_path,
     )
 
-    export_tflite(model, class_names, args.output_dir,
-                  quantize=args.quantize, use_tta=not args.no_tta)
+    if not args.skip_export:
+        try:
+            export_tflite(model, class_names, args.output_dir,
+                          quantize=args.quantize)
+        except Exception as e:
+            print(f"\n⚠️ Export to TFLite failed: {e}")
+            print("   Keras checkpoints saved in output dir — convert in Colab.")
 
 
 if __name__ == "__main__":

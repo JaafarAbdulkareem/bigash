@@ -69,7 +69,7 @@ flutter:
   uses-material-design: true
 
   assets:
-    - assets/bigash_v17.tflite
+    - assets/bigash_v18.tflite
     - assets/labels.txt
 
   # assets:

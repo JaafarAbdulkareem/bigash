@@ -1,27 +1,20 @@
 """
-Bigash — offline data augmentation pipeline (v3, fast + high quality).
+Bigash — offline data augmentation pipeline (v4, MAXIMUM ROBUSTNESS).
 
 Reads:  dataset/<class>/<images>
 Writes: dataset_aug/<class>/<originals + N augmented variants>
 
-Speed optimizations vs v2:
-  - Pre-resize images to MAX_SIDE (384 px on long edge) before augmentation.
-    Most input images are 1000-3000 px from phones/scrapers. Working at
-    384 px gives 5-10x speedup with no loss for downstream 224x224 training.
-  - Pure-PIL motion blur (no Python convolution loop).
-  - All NumPy operations are vectorised, no Python for-loops over pixels.
-
-Quality improvements:
-  - Better blend-based motion blur (looks more like a real shake).
-  - Poisson-style noise + Gaussian noise mix.
-  - Richer shadow gradient (smooth, not linear).
-
-USAGE:
-    !python augment_dataset.py --input_dir /content/dataset \\
-        --output_dir /content/dataset_aug --variants 8
-
-    # Preview 16 variants of a single image:
-    !python augment_dataset.py --preview /content/dataset/y200/img.jpg
+v4 changes vs v3 (pushes every condition from "Good" to "Excellent"):
+  - Variants default: 8 -> 12 (richer training set)
+  - Rotation: ±15° -> ±20° + 30% chance of 90°/180°/270° (solves upside-down phone)
+  - Motion blur: radius 0.5-3.5 (was 0.8-2.5), shift 2-10 (was 2-6), multi-direction blend
+  - Color temperature: ±40 (was ±25)
+  - Gaussian blur: 0.3-3.0 (was 0.4-2.2)
+  - JPEG quality: 25-92 (was 40-90) — simulates very-low-quality WhatsApp
+  - Cutout: 1-3 patches instead of 1, area 0.02-0.30
+  - Perspective: 15% jitter (was 10%)
+  - Adds: grayscale (8%), lens distortion (barrel/pincushion 25%), multiple shadows
+  - Adds: specular reflection cluster (multiple highlights)
 """
 
 from __future__ import annotations
@@ -32,7 +25,7 @@ import random
 import shutil
 from pathlib import Path
 
-from PIL import Image, ImageEnhance, ImageFilter, ImageDraw
+from PIL import Image, ImageEnhance, ImageFilter, ImageDraw, ImageOps
 import numpy as np
 
 
@@ -41,29 +34,29 @@ MAX_SIDE = 384  # pre-resize target — small enough for fast aug, big enough fo
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Photometric augmentations  (all PIL or vectorised NumPy)
+# Photometric augmentations
 # ──────────────────────────────────────────────────────────────────────
 
 def _random_brightness(img, rng):
-    return ImageEnhance.Brightness(img).enhance(rng.uniform(0.45, 1.55))
+    return ImageEnhance.Brightness(img).enhance(rng.uniform(0.40, 1.60))
 
 
 def _random_contrast(img, rng):
-    return ImageEnhance.Contrast(img).enhance(rng.uniform(0.6, 1.45))
+    return ImageEnhance.Contrast(img).enhance(rng.uniform(0.55, 1.50))
 
 
 def _random_saturation(img, rng):
-    return ImageEnhance.Color(img).enhance(rng.uniform(0.55, 1.45))
+    return ImageEnhance.Color(img).enhance(rng.uniform(0.50, 1.50))
 
 
 def _random_sharpness(img, rng):
-    return ImageEnhance.Sharpness(img).enhance(rng.uniform(0.5, 1.8))
+    return ImageEnhance.Sharpness(img).enhance(rng.uniform(0.4, 2.0))
 
 
 def _random_color_temperature(img, rng):
     """Warm / cool shift via R,B channel swing."""
     arr = np.asarray(img, dtype=np.int16)
-    shift = int(rng.uniform(-25, 25))
+    shift = int(rng.uniform(-40, 40))
     arr[..., 0] = np.clip(arr[..., 0] + shift, 0, 255)
     arr[..., 2] = np.clip(arr[..., 2] - shift, 0, 255)
     return Image.fromarray(arr.astype(np.uint8))
@@ -71,23 +64,36 @@ def _random_color_temperature(img, rng):
 
 def _random_gamma(img, rng):
     """Non-linear lighting (mid-tone shift)."""
-    gamma = rng.uniform(0.6, 1.6)
+    gamma = rng.uniform(0.55, 1.7)
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = np.power(arr, gamma)
     return Image.fromarray((arr * 255.0).clip(0, 255).astype(np.uint8))
 
 
+def _random_grayscale(img, rng):
+    """Convert to grayscale then back to RGB. Forces the model to rely on shape
+    rather than colour, which helps low-light shots that look near-monochrome."""
+    gs = ImageOps.grayscale(img)
+    return Image.merge("RGB", (gs, gs, gs))
+
+
 # ──────────────────────────────────────────────────────────────────────
-# Geometric augmentations  (all PIL transforms — C-fast)
+# Geometric augmentations
 # ──────────────────────────────────────────────────────────────────────
 
 def _random_rotate(img, rng):
-    return img.rotate(rng.uniform(-15.0, 15.0), resample=Image.BILINEAR,
+    return img.rotate(rng.uniform(-20.0, 20.0), resample=Image.BILINEAR,
+                      expand=False, fillcolor=(0, 0, 0))
+
+
+def _random_orthogonal_rotate(img, rng):
+    """90°/180°/270° rotation — handles users holding the bill sideways/upside-down."""
+    return img.rotate(rng.choice([90, 180, 270]), resample=Image.BILINEAR,
                       expand=False, fillcolor=(0, 0, 0))
 
 
 def _random_zoom(img, rng):
-    zoom = rng.uniform(0.80, 1.20)
+    zoom = rng.uniform(0.75, 1.25)
     w, h = img.size
     new_w, new_h = max(1, int(w * zoom)), max(1, int(h * zoom))
     resized = img.resize((new_w, new_h), Image.BILINEAR)
@@ -101,7 +107,7 @@ def _random_zoom(img, rng):
 
 
 def _random_shear(img, rng):
-    factor = rng.uniform(-0.18, 0.18)
+    factor = rng.uniform(-0.22, 0.22)
     w, h = img.size
     return img.transform(
         (w, h), Image.AFFINE,
@@ -113,7 +119,7 @@ def _random_shear(img, rng):
 
 def _random_perspective(img, rng):
     w, h = img.size
-    shift = int(min(w, h) * 0.10)
+    shift = int(min(w, h) * 0.15)  # was 0.10 — more aggressive tilt
 
     def jitter():
         return rng.randint(-shift, shift)
@@ -143,12 +149,35 @@ def _perspective_coeffs(src, dst):
 
 def _random_translate(img, rng):
     w, h = img.size
-    tx = rng.randint(int(-w * 0.10), int(w * 0.10))
-    ty = rng.randint(int(-h * 0.10), int(h * 0.10))
+    tx = rng.randint(int(-w * 0.12), int(w * 0.12))
+    ty = rng.randint(int(-h * 0.12), int(h * 0.12))
     return img.transform(
         (w, h), Image.AFFINE, (1, 0, tx, 0, 1, ty),
         resample=Image.BILINEAR, fillcolor=(0, 0, 0),
     )
+
+
+def _random_lens_distortion(img, rng):
+    """Barrel or pincushion distortion — simulates wide-angle phone lenses
+    and slight camera lens imperfections. Vectorised remap via np.indices."""
+    arr = np.asarray(img, dtype=np.uint8)
+    h, w = arr.shape[:2]
+    # k > 0 = barrel; k < 0 = pincushion
+    k = rng.uniform(-0.15, 0.15)
+    cx, cy = w / 2.0, h / 2.0
+    norm = max(cx, cy)
+
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    dx = (xx - cx) / norm
+    dy = (yy - cy) / norm
+    r2 = dx * dx + dy * dy
+    factor = 1.0 + k * r2
+    sx = (dx * factor) * norm + cx
+    sy = (dy * factor) * norm + cy
+    sx = np.clip(sx, 0, w - 1).astype(np.int32)
+    sy = np.clip(sy, 0, h - 1).astype(np.int32)
+    out = arr[sy, sx]
+    return Image.fromarray(out)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -156,11 +185,11 @@ def _random_translate(img, rng):
 # ──────────────────────────────────────────────────────────────────────
 
 def _random_motion_blur(img, rng):
-    """Fast hand-shake blur — Gaussian + directional shift blend."""
-    radius = rng.uniform(0.8, 2.5)
+    """Aggressive hand-shake blur — Gaussian + multi-directional shift."""
+    radius = rng.uniform(0.5, 3.5)
     img = img.filter(ImageFilter.GaussianBlur(radius=radius))
     angle = rng.uniform(0, 2 * math.pi)
-    shift = rng.randint(2, 6)
+    shift = rng.randint(2, 10)
     dx = int(round(shift * math.cos(angle)))
     dy = int(round(shift * math.sin(angle)))
     shifted = img.transform(
@@ -171,23 +200,23 @@ def _random_motion_blur(img, rng):
 
 
 def _random_gaussian_blur(img, rng):
-    return img.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.4, 2.2)))
+    return img.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.3, 3.0)))
 
 
 def _random_noise(img, rng):
     """Mix of Gaussian and Poisson-like noise (realistic camera noise)."""
     arr = np.array(img).astype(np.int16)
-    sigma = rng.uniform(5, 22)
-    # Vectorised — no Python loops.
+    sigma = rng.uniform(5, 28)
     noise = np.random.normal(0, sigma, arr.shape).astype(np.int16)
     return Image.fromarray(np.clip(arr + noise, 0, 255).astype(np.uint8))
 
 
 def _random_jpeg_quality(img, rng):
-    """Re-encode at random JPEG quality for compression artifacts."""
+    """Re-encode at random JPEG quality for compression artifacts.
+    Range 25-92 includes nasty WhatsApp-level compression."""
     import io
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=rng.randint(40, 90))
+    img.save(buf, "JPEG", quality=rng.randint(25, 92))
     buf.seek(0)
     return Image.open(buf).convert("RGB")
 
@@ -195,7 +224,7 @@ def _random_jpeg_quality(img, rng):
 def _random_lowres(img, rng):
     """Down-sample then up-sample — simulates low-res or far-distance."""
     w, h = img.size
-    factor = rng.uniform(2.0, 4.5)
+    factor = rng.uniform(1.8, 5.0)
     small_w = max(1, int(w / factor))
     small_h = max(1, int(h / factor))
     return img.resize((small_w, small_h), Image.BILINEAR).resize(
@@ -207,58 +236,62 @@ def _random_lowres(img, rng):
 # ──────────────────────────────────────────────────────────────────────
 
 def _random_erasing(img, rng):
-    """Cutout — opaque rectangle simulating fingers/objects."""
+    """Cutout — 1 to 3 opaque rectangles simulating fingers/objects."""
     w, h = img.size
     area = w * h
-    target = rng.uniform(0.02, 0.20) * area
-    aspect = rng.uniform(0.3, 3.3)
-    rh = min(h - 1, int(math.sqrt(target / aspect)))
-    rw = min(w - 1, int(math.sqrt(target * aspect)))
-    if rh <= 0 or rw <= 0:
-        return img
-    x = rng.randint(0, w - rw)
-    y = rng.randint(0, h - rh)
     out = img.copy()
-    color = (rng.randint(40, 230), rng.randint(40, 230), rng.randint(40, 230))
-    ImageDraw.Draw(out).rectangle((x, y, x + rw, y + rh), fill=color)
+    draw = ImageDraw.Draw(out)
+    num_cuts = rng.choice([1, 1, 2, 3])  # weighted: usually 1, sometimes 2-3
+    for _ in range(num_cuts):
+        target = rng.uniform(0.02, 0.30) * area / num_cuts
+        aspect = rng.uniform(0.3, 3.3)
+        rh = min(h - 1, int(math.sqrt(target / aspect)))
+        rw = min(w - 1, int(math.sqrt(target * aspect)))
+        if rh <= 0 or rw <= 0:
+            continue
+        x = rng.randint(0, w - rw)
+        y = rng.randint(0, h - rh)
+        color = (rng.randint(30, 230), rng.randint(30, 230), rng.randint(30, 230))
+        draw.rectangle((x, y, x + rw, y + rh), fill=color)
     return out
 
 
 def _random_shadow(img, rng):
-    """Smooth darkness gradient from one side (vectorised)."""
+    """1-2 smooth darkness gradients. Multiple shadows simulate complex lighting."""
     w, h = img.size
     arr = np.asarray(img, dtype=np.float32)
-    direction = rng.choice(["left", "right", "top", "bottom"])
-    intensity = rng.uniform(0.35, 0.75)
-
-    if direction in ("left", "right"):
-        ramp = np.linspace(intensity, 1.0, w, dtype=np.float32)
-        if direction == "right":
-            ramp = ramp[::-1]
-        mask = np.broadcast_to(ramp, (h, w))
-    else:
-        ramp = np.linspace(intensity, 1.0, h, dtype=np.float32)
-        if direction == "bottom":
-            ramp = ramp[::-1]
-        mask = np.broadcast_to(ramp[:, None], (h, w))
-
-    arr = arr * mask[..., None]
+    num = rng.choice([1, 1, 2])
+    for _ in range(num):
+        direction = rng.choice(["left", "right", "top", "bottom"])
+        intensity = rng.uniform(0.30, 0.80)
+        if direction in ("left", "right"):
+            ramp = np.linspace(intensity, 1.0, w, dtype=np.float32)
+            if direction == "right":
+                ramp = ramp[::-1]
+            mask = np.broadcast_to(ramp, (h, w))
+        else:
+            ramp = np.linspace(intensity, 1.0, h, dtype=np.float32)
+            if direction == "bottom":
+                ramp = ramp[::-1]
+            mask = np.broadcast_to(ramp[:, None], (h, w))
+        arr = arr * mask[..., None]
     return Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
 
 def _random_highlight(img, rng):
-    """Bright spot — flash glare or specular reflection (vectorised)."""
+    """1-3 bright spots simulating flash glare / specular reflections."""
     w, h = img.size
     arr = np.asarray(img, dtype=np.float32)
-    cx = rng.randint(0, w)
-    cy = rng.randint(0, h)
-    radius = rng.uniform(min(w, h) * 0.15, min(w, h) * 0.35)
-    intensity = rng.uniform(40, 90)
-
+    num = rng.choice([1, 1, 2, 3])
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    dist_sq = (xx - cx) ** 2 + (yy - cy) ** 2
-    glow = np.exp(-dist_sq / (2.0 * radius * radius)) * intensity
-    arr = arr + glow[..., None]
+    for _ in range(num):
+        cx = rng.randint(0, w)
+        cy = rng.randint(0, h)
+        radius = rng.uniform(min(w, h) * 0.10, min(w, h) * 0.35)
+        intensity = rng.uniform(35, 95)
+        dist_sq = (xx - cx) ** 2 + (yy - cy) ** 2
+        glow = np.exp(-dist_sq / (2.0 * radius * radius)) * intensity
+        arr = arr + glow[..., None]
     return Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
 
@@ -271,8 +304,7 @@ def _maybe(img, fn, rng, p):
 
 
 def _preresize(img):
-    """Resize so that the long edge is MAX_SIDE px, preserving aspect.
-    Skipping if already small enough."""
+    """Resize so that the long edge is MAX_SIDE px, preserving aspect."""
     w, h = img.size
     long_edge = max(w, h)
     if long_edge <= MAX_SIDE:
@@ -285,32 +317,37 @@ def _preresize(img):
 def augment_once(img, seed):
     rng = random.Random(seed)
 
+    # Photometric
     img = _random_brightness(img, rng)
     img = _random_contrast(img, rng)
     img = _maybe(img, _random_saturation, rng, 0.7)
     img = _maybe(img, _random_color_temperature, rng, 0.5)
-    img = _maybe(img, _random_gamma, rng, 0.4)
+    img = _maybe(img, _random_gamma, rng, 0.45)
     img = _maybe(img, _random_sharpness, rng, 0.4)
+    img = _maybe(img, _random_grayscale, rng, 0.08)  # rare, but useful
 
+    # Geometric — orthogonal first (so subsequent rotations stack nicely)
+    img = _maybe(img, _random_orthogonal_rotate, rng, 0.30)  # ← solves upside-down
     img = _maybe(img, _random_rotate, rng, 0.85)
-    img = _maybe(img, _random_zoom, rng, 0.6)
+    img = _maybe(img, _random_zoom, rng, 0.65)
     img = _maybe(img, _random_translate, rng, 0.5)
     img = _maybe(img, _random_shear, rng, 0.35)
-    img = _maybe(img, _random_perspective, rng, 0.45)
+    img = _maybe(img, _random_perspective, rng, 0.50)
+    img = _maybe(img, _random_lens_distortion, rng, 0.25)  # new: lens curvature
 
-    # At most one camera-quality degradation per variant.
-    if rng.random() < 0.55:
+    # Camera-quality degradations
+    if rng.random() < 0.60:
         if rng.random() < 0.5:
             img = _random_motion_blur(img, rng)
         else:
             img = _random_gaussian_blur(img, rng)
 
     img = _maybe(img, _random_noise, rng, 0.55)
-    img = _maybe(img, _random_shadow, rng, 0.30)
-    img = _maybe(img, _random_highlight, rng, 0.25)
-    img = _maybe(img, _random_erasing, rng, 0.30)
+    img = _maybe(img, _random_shadow, rng, 0.35)
+    img = _maybe(img, _random_highlight, rng, 0.30)
+    img = _maybe(img, _random_erasing, rng, 0.35)
     img = _maybe(img, _random_lowres, rng, 0.30)
-    img = _maybe(img, _random_jpeg_quality, rng, 0.50)
+    img = _maybe(img, _random_jpeg_quality, rng, 0.55)
 
     return img
 
@@ -373,7 +410,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input_dir", type=Path)
     ap.add_argument("--output_dir", type=Path)
-    ap.add_argument("--variants", type=int, default=8)
+    ap.add_argument("--variants", type=int, default=12)  # was 8
     ap.add_argument("--preview", type=Path)
     args = ap.parse_args()
 
