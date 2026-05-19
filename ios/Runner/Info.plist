@@ -2,10 +2,18 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Camera is required to scan currency bills. App Store rejects apps -->
+	<!-- with permission descriptions that don't match actual usage, so we -->
+	<!-- explain the humanitarian purpose explicitly. -->
 	<key>NSCameraUsageDescription</key>
-	<string>This app needs camera access to visually scan and identify currency notes.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>This app needs microphone access for potential accessibility tools.</string>
+	<string>يحتاج بقش إلى الكاميرا للتعرف على فئات العملة الورقية اليمنية ومساعدة المستخدمين ذوي الإعاقة البصرية. The Bigash app needs camera access to recognize Yemeni banknotes and assist visually impaired users.</string>
+
+	<!-- Photo library write permission is needed by the `gal` plugin when -->
+	<!-- the user long-presses to save a debug screenshot. We never read -->
+	<!-- existing photos, so no NSPhotoLibraryUsageDescription. -->
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>لحفظ لقطة شاشة المسح في معرض الصور. To save scan screenshots to your photo gallery.</string>
+
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -26,25 +34,32 @@
 	<string>????</string>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
+
+	<!-- Arabic language support (right-to-left). -->
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>ar</string>
+		<string>en</string>
+	</array>
+
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>
 	<string>Main</string>
+
+	<!-- Portrait only — blind users hold the phone upright; allowing -->
+	<!-- landscape would just confuse the camera orientation logic. -->
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationPortraitUpsideDown</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>

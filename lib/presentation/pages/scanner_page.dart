@@ -17,8 +17,35 @@ class ScannerPage extends StatefulWidget {
   State<ScannerPage> createState() => _ScannerPageState();
 }
 
-class _ScannerPageState extends State<ScannerPage> {
+class _ScannerPageState extends State<ScannerPage>
+    with WidgetsBindingObserver {
   final GlobalKey _captureKey = GlobalKey();
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Pause the camera + vibration + TTS when the app goes to background
+    // so we don't burn battery, leak the camera handle, or crash on resume.
+    final DetectionCubit cubit = context.read<DetectionCubit>();
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden) {
+      cubit.pauseForBackground();
+    } else if (state == AppLifecycleState.resumed) {
+      cubit.resumeFromBackground();
+    }
+  }
 
   /// Avoid [CameraPreview] if the controller was disposed (stale state / race).
   static bool _canShowCameraPreview(CameraController? c, bool isActive) {

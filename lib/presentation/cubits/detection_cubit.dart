@@ -100,12 +100,17 @@ class DetectionCubit extends Cubit<DetectionState> {
   bool _torchOn = false;
 
   /// Minimum confidence for a currency-class frame to count as a vote.
-  static const double _currencyThreshold = 0.55;
+  /// Lower than v17 (was 0.55) because the v18 model is less individually
+  /// confident but more accurate — the top class is usually right even at
+  /// 40-50%. TTA in tflite_service then bumps the average to ~50-70%.
+  static const double _currencyThreshold = 0.40;
   /// Minimum confidence for an "other" frame to count as a vote.
-  /// Higher than currency so ambiguous frames (other=40%, y500=30%) don't
-  /// lock the app into permanent silence — instead they trigger torch and
-  /// give the user a chance to reposition the bill.
-  static const double _otherThreshold = 0.75;
+  /// Lowered from 0.75 in line with the new model's calibration.
+  static const double _otherThreshold = 0.55;
+  /// The top prediction must beat the runner-up by at least this margin to
+  /// count as a confident vote. Stops "other=42%, y500=39%" frames from
+  /// nudging the vote either way.
+  static const double _voteMargin = 0.08;
   /// Number of recent frames we remember for majority voting.
   static const int _voteWindowSize = 10;
   /// How many of those frames must agree to announce the bill.
@@ -204,6 +209,19 @@ class DetectionCubit extends Cubit<DetectionState> {
         .join('  |  ');
   }
 
+  /// True if the top prediction beats the runner-up by [_voteMargin].
+  /// Skips voting on ambiguous frames where two classes are nearly tied
+  /// (e.g. y200=42%, y500=39%) — those frames silently turn the torch on
+  /// and let the user reposition the bill.
+  bool _hasMargin(CurrencyEntity entity) {
+    if (entity.topK.length < 2) {
+      return true; // not enough info; trust the top class
+    }
+    final double top = entity.topK[0].value;
+    final double second = entity.topK[1].value;
+    return (top - second) >= _voteMargin;
+  }
+
   void _onCurrencyEntity(CurrencyEntity entity) {
     if (!state.isActive || _inCooldown) {
       return;
@@ -211,11 +229,13 @@ class DetectionCubit extends Cubit<DetectionState> {
 
     final String debugText = _buildDebugText(entity);
     final String key = normalizeYemeniClassifierLabel(entity.label);
+    final bool hasMargin = _hasMargin(entity);
 
     if (isIgnoredYemeniCurrencyLabel(key)) {
-      // Only a high-confidence "other" counts as a vote. Ambiguous frames
-      // (other=40%, y500=30%) would otherwise lock out currency detection.
-      if (entity.confidence >= _otherThreshold) {
+      // Strong, decisive "other" = silent scanning (no torch, no alarm).
+      // The user is pointing at a foreign bill / hand / paper, which is a
+      // valid state — don't bombard them with feedback.
+      if (entity.confidence >= _otherThreshold && hasMargin) {
         _pushVote(key);
         unawaited(_setTorch(false));
         emit(
@@ -226,11 +246,13 @@ class DetectionCubit extends Cubit<DetectionState> {
           ),
         );
       } else {
+        // Ambiguous: top is "other" but confidence < 0.55 or close to next
+        // class. Could be a poorly-lit currency bill. Torch on to help.
         unawaited(_setTorch(true));
         emit(
           state.copyWith(
             phase: CurrencyDetectionPhase.lowLight,
-            statusText: 'غير واضح — حاول تغيير الزاوية',
+            statusText: 'حاول تقريب العملة وثبّتها أمام الكاميرا',
             debugText: debugText,
           ),
         );
@@ -238,13 +260,15 @@ class DetectionCubit extends Cubit<DetectionState> {
       return;
     }
 
-    if (entity.confidence <= _currencyThreshold) {
-      // Low-confidence currency frames don't vote; turn on torch to help.
+    if (entity.confidence <= _currencyThreshold || !hasMargin) {
+      // Currency suspected but not confident. Could be: low light, bad
+      // angle, hand shaking, or the bill is partially out of frame.
+      // Torch on to help — light fixes most of these.
       unawaited(_setTorch(true));
       emit(
         state.copyWith(
           phase: CurrencyDetectionPhase.lowLight,
-          statusText: 'إضاءة منخفضة — تم تشغيل الفلاش',
+          statusText: 'ثبّت يدك واقترب من العملة',
           debugText: debugText,
         ),
       );
@@ -335,6 +359,30 @@ class DetectionCubit extends Cubit<DetectionState> {
         ),
       );
     });
+  }
+
+  /// Pauses scanning when the app goes to the background. Keeps the camera
+  /// controller alive so we can resume quickly — disposing+reopening on
+  /// every backgrounding event causes visible delay and battery churn.
+  Future<void> pauseForBackground() async {
+    if (!state.isActive) {
+      return;
+    }
+    _stopPulsingVibration();
+    await _repository.pauseCamera();
+    await _ttsService.stop();
+  }
+
+  Future<void> resumeFromBackground() async {
+    if (!state.isActive) {
+      return;
+    }
+    // Stale votes from before the background pause are no longer
+    // meaningful — what the user was scanning might be totally different
+    // now. Reset so we don't false-trigger on resume.
+    _voteWindow.clear();
+    await _repository.resumeCamera();
+    _startPulsingVibration();
   }
 
   Future<void> stop() async {

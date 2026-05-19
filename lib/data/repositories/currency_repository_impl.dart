@@ -57,6 +57,18 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
   }
 
   @override
+  Future<void> pauseCamera() async {
+    // Keep the subscription alive — we'll resume from where we paused.
+    await cameraService.setTorchEnabled(false);
+    await cameraService.pauseStreaming();
+  }
+
+  @override
+  Future<void> resumeCamera() async {
+    await cameraService.resumeStreaming();
+  }
+
+  @override
   Future<void> setTorchEnabled(bool enabled) =>
       cameraService.setTorchEnabled(enabled);
 
