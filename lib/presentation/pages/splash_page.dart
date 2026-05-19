@@ -16,7 +16,7 @@ class SplashPage extends StatefulWidget {
 
 class _SplashPageState extends State<SplashPage> {
   bool _waitingForPermission = false;
-  String _status = 'مرحبا بك في تطبيق بقش';
+  String _status = 'مرحبا بك في تطبيق بيقش';
 
   @override
   void initState() {
@@ -26,7 +26,7 @@ class _SplashPageState extends State<SplashPage> {
 
   Future<void> _initAndRoute() async {
     await widget.ttsService.initialize();
-    await widget.ttsService.speak('مرحبا بك في تطبيق بقش');
+    await widget.ttsService.speak('مرحبا بك في تطبيق بيقش');
 
     final bool granted = await _ensureCameraPermission();
     if (!granted) {

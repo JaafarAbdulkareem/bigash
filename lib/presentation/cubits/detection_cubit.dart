@@ -8,6 +8,7 @@ import 'package:camera/camera.dart';
 import 'package:equatable/equatable.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:vibration/vibration.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 /// High-level UI / accessibility phase for currency scanning.
 enum CurrencyDetectionPhase {
@@ -154,8 +155,34 @@ class DetectionCubit extends Cubit<DetectionState> {
     _canVibrate = await Vibration.hasVibrator();
 
     await _repository.startCamera();
+
+    // If the camera could not open, say so out loud instead of leaving the
+    // blind user on a silent screen that never detects anything.
+    if (!_repository.isCameraReady) {
+      await _repository.stopCamera();
+      emit(
+        state.copyWith(
+          isActive: false,
+          phase: CurrencyDetectionPhase.idle,
+          statusText:
+              'تعذّر تشغيل الكاميرا. تأكّد من الإذن ثم اضغط لإعادة المحاولة.',
+          clearCamera: true,
+        ),
+      );
+      await _ttsService.speak(
+        'تعذّر تشغيل الكاميرا. تأكّد من السماح للتطبيق باستخدام الكاميرا، '
+        'ثم اضغط على الشاشة لإعادة المحاولة.',
+      );
+      return;
+    }
+
     await _repository.setTorchEnabled(false);
     _torchOn = false;
+
+    // Hold the screen awake while scanning: the user keeps the phone still
+    // on a bill and would not notice the display timing out — which would
+    // background the app and silently stop detection.
+    unawaited(WakelockPlus.enable());
 
     emit(
       state.copyWith(
@@ -340,12 +367,6 @@ class DetectionCubit extends Cubit<DetectionState> {
     return null;
   }
 
-  Future<void> cycleNormalization() async {
-    _repository.cycleNormalization();
-    _voteWindow.clear();
-    await _ttsService.speak('تم تغيير وضع المعالجة: ${_repository.diagnostics}');
-  }
-
   Future<void> _finishSuccessAnnouncement(String text) async {
     await _ttsService.speak(text);
     _cooldownTimer?.cancel();
@@ -372,6 +393,7 @@ class DetectionCubit extends Cubit<DetectionState> {
       return;
     }
     _stopPulsingVibration();
+    unawaited(WakelockPlus.disable());
     await _repository.pauseCamera();
     await _ttsService.stop();
   }
@@ -386,6 +408,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     _voteWindow.clear();
     await _repository.resumeCamera();
     _startPulsingVibration();
+    unawaited(WakelockPlus.enable());
   }
 
   Future<void> stop() async {
@@ -393,6 +416,7 @@ class DetectionCubit extends Cubit<DetectionState> {
       return;
     }
     _stopPulsingVibration();
+    unawaited(WakelockPlus.disable());
     _cooldownTimer?.cancel();
     _cooldownTimer = null;
     _cooldownUntil = null;
@@ -427,6 +451,7 @@ class DetectionCubit extends Cubit<DetectionState> {
   @override
   Future<void> close() async {
     _stopPulsingVibration();
+    unawaited(WakelockPlus.disable());
     _cooldownTimer?.cancel();
     await _currencySubscription?.cancel();
     if (!isClosed) {

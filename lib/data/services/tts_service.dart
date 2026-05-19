@@ -6,11 +6,16 @@ class TTSService {
   final FlutterTts _flutterTts;
   bool _initialized = false;
   bool _initFailed = false;
+  bool _arabicVoiceAvailable = true;
 
   TTSService(this._flutterTts);
 
   bool get isReady => _initialized && !_initFailed;
   bool get initFailed => _initFailed;
+
+  /// False when the device has no Arabic TTS voice installed — spoken
+  /// announcements may then be silent or mispronounced.
+  bool get arabicVoiceAvailable => _arabicVoiceAvailable;
 
   Future<void> initialize() async {
     if (_initialized) return;
@@ -20,6 +25,20 @@ class TTSService {
       await _flutterTts.setSpeechRate(0.48);
       await _flutterTts.awaitSpeakCompletion(true);
       _initialized = true;
+
+      // setLanguage() does not throw when no Arabic voice is installed —
+      // it just yields silent or mispronounced speech. Verify explicitly,
+      // since audio is the primary channel for a blind user.
+      try {
+        final dynamic arOk = await _flutterTts.isLanguageAvailable('ar');
+        _arabicVoiceAvailable = arOk == true || arOk == 1;
+        if (!_arabicVoiceAvailable) {
+          debugPrint('[TTS] no Arabic voice installed — announcements may be '
+              'silent. The device needs an Arabic TTS voice.');
+        }
+      } catch (e) {
+        debugPrint('[TTS] isLanguageAvailable check failed: $e');
+      }
     } catch (e) {
       // TTS initialization can fail on devices without a TTS engine
       // (some emulators, stripped ROMs). Mark as failed so callers can

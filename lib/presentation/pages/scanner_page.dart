@@ -7,7 +7,6 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:camera/camera.dart';
 import 'package:gal/gal.dart';
 
-import 'package:bigash/presentation/cubits/camera_toggle_cubit.dart';
 import 'package:bigash/presentation/cubits/detection_cubit.dart';
 
 class ScannerPage extends StatefulWidget {
@@ -61,7 +60,7 @@ class _ScannerPageState extends State<ScannerPage>
 
   static String _semanticsLabel(DetectionState s) {
     if (!s.isActive) {
-      return 'اضغط لتشغيل الكاميرا. ضغط مطوّل لالتقاط صورة الشاشة. نقر مزدوج لتبديل وضع المعالجة.';
+      return 'اضغط لتشغيل الكاميرا. ضغط مطوّل لالتقاط صورة الشاشة.';
     }
     switch (s.phase) {
       case CurrencyDetectionPhase.scanning:
@@ -134,13 +133,9 @@ class _ScannerPageState extends State<ScannerPage>
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: () async {
-                context.read<CameraToggleCubit>().toggle();
                 await context.read<DetectionCubit>().toggle();
               },
               onLongPress: _captureScreenshot,
-              onDoubleTap: () async {
-                await context.read<DetectionCubit>().cycleNormalization();
-              },
               child: RepaintBoundary(
                 key: _captureKey,
                 child: Stack(
@@ -150,24 +145,6 @@ class _ScannerPageState extends State<ScannerPage>
                       CameraPreview(controller)
                     else
                       const ColoredBox(color: Colors.black),
-                    if (mlState.isActive && mlState.debugText.isNotEmpty)
-                      Align(
-                        alignment: Alignment.topCenter,
-                        child: Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.fromLTRB(12, 48, 12, 12),
-                          color: Colors.black.withValues(alpha: 0.55),
-                          child: Text(
-                            mlState.debugText,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              color: Colors.cyanAccent,
-                              fontSize: 16,
-                              fontFamily: 'monospace',
-                            ),
-                          ),
-                        ),
-                      ),
                     Align(
                       alignment: Alignment.bottomCenter,
                       child: Container(

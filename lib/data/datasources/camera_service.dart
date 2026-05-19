@@ -66,13 +66,13 @@ class CameraService {
       orElse: () => cameras.first,
     );
 
-    // Try the highest resolution we can. If that fails (rare, but happens on
-    // budget devices), fall back to lower presets. Better detail → better
-    // currency recognition, especially for small denominations.
+    // The model only consumes a 224x224 crop, so medium (640x480) already
+    // carries ample detail while doing ~4x less per-frame YUV->RGB
+    // conversion work than 720p — which keeps the scan responsive on
+    // mid-range phones. Fall back to low only if medium is unsupported.
     final List<ResolutionPreset> presets = <ResolutionPreset>[
-      ResolutionPreset.high, // 1280x720 — sweet spot for bills
-      ResolutionPreset.medium, // 640x480 — fallback
-      ResolutionPreset.low, // 320x240 — last resort
+      ResolutionPreset.medium, // 640x480 — preferred
+      ResolutionPreset.low, // 320x240 — fallback
     ];
 
     bool initialized = false;

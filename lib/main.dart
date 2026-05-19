@@ -1,27 +1,36 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:bigash/core/di/injection_container.dart' as di;
 import 'package:bigash/data/services/tts_service.dart';
-import 'package:bigash/presentation/cubits/camera_toggle_cubit.dart';
 import 'package:bigash/presentation/cubits/detection_cubit.dart';
 import 'package:bigash/presentation/pages/splash_page.dart';
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
+void main() {
+  // Run inside a guarded zone so an otherwise-unhandled async error does
+  // not hard-crash the app — a crash leaves a blind user with no feedback
+  // at all. Errors are logged; the UI keeps running.
+  runZonedGuarded<Future<void>>(() async {
+    WidgetsFlutterBinding.ensureInitialized();
 
-  // Lock to portrait. Blind users hold the phone upright; rotating would
-  // confuse the camera orientation logic and produce wrong predictions.
-  await SystemChrome.setPreferredOrientations(<DeviceOrientation>[
-    DeviceOrientation.portraitUp,
-  ]);
+    FlutterError.onError = (FlutterErrorDetails details) {
+      FlutterError.presentError(details);
+      debugPrint('[FlutterError] ${details.exception}');
+    };
 
-  // Keep the screen on while scanning — a blind user can't tell that the
-  // display has dimmed before timeout and might think the app stopped.
-  // (Implemented via persistent overlay + scanner-page-level wake handling.)
+    // Lock to portrait. Blind users hold the phone upright; rotating would
+    // confuse the camera orientation logic and produce wrong predictions.
+    await SystemChrome.setPreferredOrientations(<DeviceOrientation>[
+      DeviceOrientation.portraitUp,
+    ]);
 
-  di.init();
-  runApp(const BigashApp());
+    di.init();
+    runApp(const BigashApp());
+  }, (Object error, StackTrace stack) {
+    debugPrint('[Uncaught] $error\n$stack');
+  });
 }
 
 class BigashApp extends StatelessWidget {
@@ -29,15 +38,8 @@ class BigashApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MultiBlocProvider(
-      providers: [
-        BlocProvider<CameraToggleCubit>(
-          create: (_) => di.sl<CameraToggleCubit>(),
-        ),
-        BlocProvider<DetectionCubit>(
-          create: (_) => di.sl<DetectionCubit>(),
-        ),
-      ],
+    return BlocProvider<DetectionCubit>(
+      create: (_) => di.sl<DetectionCubit>(),
       child: MaterialApp(
         title: 'Bigash',
         debugShowCheckedModeBanner: false,

@@ -32,20 +32,19 @@ enum NormalizationMode { raw, signed, unsigned, imageNet }
 class TFLiteService {
   static const String modelAssetPath = 'assets/bigash_v18.tflite';
 
-  /// Slightly longer interval than v17 (was 100ms) because TTA runs 4
-  /// inferences per frame. ~250ms still gives 4 FPS detection, fast enough
-  /// for blind-user scanning.
+  /// One inference per frame at ~250 ms — a steady detection cadence for
+  /// blind-user scanning.
   static const Duration _minFrameInterval = Duration(milliseconds: 250);
 
-  /// bigash_v18 has its own Rescaling layer baked in, so the model expects
+  /// The bigash model has its own Rescaling layer baked in, so it expects
   /// raw [0, 255] float32 pixel values — no Flutter-side normalization.
   NormalizationMode normalization = NormalizationMode.raw;
 
-  /// Run inference on 4 rotations (0°, 90°, 180°, 270°) and average the
-  /// softmax outputs. Boosts confidence by ~10-25% on correct predictions
-  /// because the model was trained with random 90/180/270 rotation
-  /// augmentation, so all orientations are valid.
-  bool useTTA = true;
+  /// Test-time augmentation: average inference over 4 rotations. Off by
+  /// default — the model is already trained with 90/180/270 rotation
+  /// augmentation, and running 4 inferences per frame noticeably slows the
+  /// scan. Flip to true only if field testing shows rotated bills are missed.
+  bool useTTA = false;
 
   Interpreter? _interpreter;
   List<String> _labels = <String>[];
@@ -61,24 +60,6 @@ class TFLiteService {
   double _outputScale = 1.0;
   int _outputZeroPoint = 0;
   int _numClasses = 0;
-
-  String get diagnostics =>
-      'in=${_inputWidth}x$_inputHeight ${_inputIsUint8 ? "uint8" : "float32"} '
-      '${_inputIsUint8 ? "scale=$_inputScale zp=$_inputZeroPoint" : normalization.name} '
-      'TTA=${useTTA ? "on" : "off"} '
-      '/ out=$_numClasses ${_outputIsUint8 ? "uint8" : "float32"}';
-
-  void cycleNormalization() {
-    const modes = NormalizationMode.values;
-    final next = (normalization.index + 1) % modes.length;
-    normalization = modes[next];
-    debugPrint('[TFLite] normalization -> ${normalization.name}');
-  }
-
-  void toggleTTA() {
-    useTTA = !useTTA;
-    debugPrint('[TFLite] TTA -> ${useTTA ? "ON (4x slower, more accurate)" : "OFF (faster)"}');
-  }
 
   final StreamController<TFLiteResult> _streamController =
       StreamController<TFLiteResult>.broadcast();
@@ -432,6 +413,10 @@ class TFLiteService {
         order: img.ChannelOrder.bgra,
       );
     }
+    debugPrint(
+      '[TFLite] unsupported camera frame format: ${image.format.group} '
+      '— frame skipped',
+    );
     return null;
   }
 

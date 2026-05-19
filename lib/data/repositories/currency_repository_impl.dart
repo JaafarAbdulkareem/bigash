@@ -23,10 +23,7 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
   bool get isModelLoaded => tfliteService.isModelLoaded;
 
   @override
-  String get diagnostics => tfliteService.diagnostics;
-
-  @override
-  void cycleNormalization() => tfliteService.cycleNormalization();
+  bool get isCameraReady => cameraService.isInitialized;
 
   @override
   CameraController? get cameraController => cameraService.cameraController;

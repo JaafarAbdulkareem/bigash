@@ -1,7 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.VIBRATE" />
-    <uses-permission android:name="android.permission.FLASHLIGHT" />
+    <!-- The torch is controlled through the Camera2 API, which does not
+         require the (legacy) FLASHLIGHT permission. -->
 
     <!-- Required by the `gal` plugin to save screenshots to the gallery on
          Android 9 and below. Android 10+ uses MediaStore and ignores this. -->
@@ -17,7 +18,7 @@
     <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
 
     <application
-        android:label="بقش"
+        android:label="بيقش"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

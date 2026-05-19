@@ -4,7 +4,6 @@ import 'package:bigash/data/repositories/currency_repository_impl.dart';
 import 'package:bigash/data/services/tflite_service.dart';
 import 'package:bigash/data/services/tts_service.dart';
 import 'package:bigash/domain/repositories/currency_repository.dart';
-import 'package:bigash/presentation/cubits/camera_toggle_cubit.dart';
 import 'package:bigash/presentation/cubits/detection_cubit.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
@@ -21,7 +20,6 @@ void init() {
     tfliteService: sl(),
   ));
 
-  sl.registerFactory<CameraToggleCubit>(() => CameraToggleCubit());
   sl.registerFactory<DetectionCubit>(
     () => DetectionCubit(
       repository: sl(),

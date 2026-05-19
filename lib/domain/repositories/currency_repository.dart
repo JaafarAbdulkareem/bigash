@@ -3,7 +3,8 @@ import 'package:camera/camera.dart';
 
 abstract class CurrencyRepository {
   bool get isModelLoaded;
-  String get diagnostics;
+  /// True once the camera has successfully initialized and is streaming.
+  bool get isCameraReady;
 
   Stream<CurrencyEntity> getCurrencyStream();
   Future<void> initialize();
@@ -14,7 +15,6 @@ abstract class CurrencyRepository {
   /// Resumes camera streaming after a [pauseCamera] call.
   Future<void> resumeCamera();
   Future<void> setTorchEnabled(bool enabled);
-  void cycleNormalization();
   CameraController? get cameraController;
   void dispose();
 }
