@@ -100,21 +100,24 @@ class DetectionCubit extends Cubit<DetectionState> {
   bool _torchOn = false;
 
   /// Minimum confidence for a currency-class frame to count as a vote.
-  /// Lower than v17 (was 0.55) because the v18 model is less individually
-  /// confident but more accurate — the top class is usually right even at
-  /// 40-50%. TTA in tflite_service then bumps the average to ~50-70%.
-  static const double _currencyThreshold = 0.40;
+  /// Deliberately strict: this is a money app for blind users, so a
+  /// confidently-wrong announcement is far worse than a slower one. Frames
+  /// below this turn the torch on and ask the user to reposition the bill
+  /// instead of voting.
+  static const double _currencyThreshold = 0.55;
   /// Minimum confidence for an "other" frame to count as a vote.
-  /// Lowered from 0.75 in line with the new model's calibration.
   static const double _otherThreshold = 0.55;
   /// The top prediction must beat the runner-up by at least this margin to
-  /// count as a confident vote. Stops "other=42%, y500=39%" frames from
-  /// nudging the vote either way.
-  static const double _voteMargin = 0.08;
+  /// count as a confident vote. This wide margin is the main guard against
+  /// confusing visually-similar denominations (e.g. y200 vs y250): an
+  /// ambiguous frame turns the torch on rather than voting either way.
+  static const double _voteMargin = 0.15;
   /// Number of recent frames we remember for majority voting.
-  static const int _voteWindowSize = 10;
-  /// How many of those frames must agree to announce the bill.
-  static const int _requiredMatches = 3;
+  static const int _voteWindowSize = 12;
+  /// How many of those frames must agree to announce the bill. Combined with
+  /// the confidence and margin gates above, requiring 5 of 12 makes a wrong
+  /// announcement very unlikely while still confirming within a few seconds.
+  static const int _requiredMatches = 5;
   static const Duration _speechCooldown = Duration(seconds: 3);
 
   bool get _inCooldown =>

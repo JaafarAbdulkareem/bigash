@@ -1,20 +1,26 @@
 """
-Bigash — offline data augmentation pipeline (v4, MAXIMUM ROBUSTNESS).
+Bigash — offline data augmentation pipeline (v5, LEAK-FREE SPLIT).
 
 Reads:  dataset/<class>/<images>
-Writes: dataset_aug/<class>/<originals + N augmented variants>
+Writes: dataset_aug/train/<class>/  (originals + N augmented variants)
+        dataset_aug/val/<class>/    (raw originals only — no augmentation)
 
-v4 changes vs v3 (pushes every condition from "Good" to "Excellent"):
-  - Variants default: 8 -> 12 (richer training set)
-  - Rotation: ±15° -> ±20° + 30% chance of 90°/180°/270° (solves upside-down phone)
-  - Motion blur: radius 0.5-3.5 (was 0.8-2.5), shift 2-10 (was 2-6), multi-direction blend
-  - Color temperature: ±40 (was ±25)
-  - Gaussian blur: 0.3-3.0 (was 0.4-2.2)
-  - JPEG quality: 25-92 (was 40-90) — simulates very-low-quality WhatsApp
-  - Cutout: 1-3 patches instead of 1, area 0.02-0.30
-  - Perspective: 15% jitter (was 10%)
-  - Adds: grayscale (8%), lens distortion (barrel/pincushion 25%), multiple shadows
-  - Adds: specular reflection cluster (multiple highlights)
+v5 — critical correctness fix vs v4:
+  - The train/val split now happens HERE, on the SOURCE images, BEFORE any
+    augmentation. Previously augmentation ran first and train_bigash_model.py
+    split the already-augmented folder — so augmented variants of the same
+    photo leaked into both train and val, inflating val accuracy into
+    fiction. Splitting the sources first is the only way the reported
+    accuracy reflects real-world performance.
+  - Validation images are kept RAW (no augmentation): val must measure how
+    the model does on real photos, not how it survives our filters.
+  - Use --val_split to control the held-out fraction (default 0.2).
+
+v4 augmentation set (unchanged — applied to TRAINING images only):
+  - 12 variants per image; rotation ±20° + 30% chance of 90°/180°/270°
+  - motion/gaussian blur, color temperature, gamma, grayscale (8%)
+  - JPEG quality 25-92, cutout 1-3 patches, perspective, lens distortion
+  - shadows and specular-highlight clusters
 """
 
 from __future__ import annotations
@@ -352,30 +358,68 @@ def augment_once(img, seed):
     return img
 
 
-def process_class(class_dir, out_dir, variants):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    imgs = [p for p in class_dir.iterdir() if p.suffix.lower() in VALID_EXT]
-    print(f"  [{class_dir.name}] {len(imgs)} originals -> "
-          f"{len(imgs) * (variants + 1)} total")
+def process_class(class_dir, train_out, val_out, variants, val_split, seed):
+    """Split this class's SOURCE images into train/val, THEN augment.
 
-    for idx, src_path in enumerate(imgs):
+    Splitting before augmentation is the whole point of v5: augmented
+    variants of one photo must never land in both train and val, or the
+    reported val accuracy becomes meaningless."""
+    train_out.mkdir(parents=True, exist_ok=True)
+    val_out.mkdir(parents=True, exist_ok=True)
+
+    imgs = sorted(p for p in class_dir.iterdir()
+                  if p.suffix.lower() in VALID_EXT)
+    if not imgs:
+        print(f"  [{class_dir.name}] no images — skipped")
+        return
+
+    # Deterministic per-class shuffle, then hold out `val_split` of the
+    # SOURCE images. Seeded so re-runs produce the exact same split.
+    rng = random.Random(f"{seed}:{class_dir.name}")
+    shuffled = imgs[:]
+    rng.shuffle(shuffled)
+    n_val = int(round(len(shuffled) * val_split))
+    if len(shuffled) >= 2:
+        n_val = min(max(n_val, 1), len(shuffled) - 1)  # never empty either side
+    else:
+        n_val = 0
+    val_imgs = shuffled[:n_val]
+    train_imgs = shuffled[n_val:]
+
+    print(f"  [{class_dir.name}] {len(imgs)} originals -> "
+          f"train {len(train_imgs)} (+{len(train_imgs) * variants} aug)  |  "
+          f"val {len(val_imgs)} (raw)")
+    if n_val == 0:
+        print(f"    ⚠️ '{class_dir.name}' has too few images for a val split "
+              f"— add more photos of this denomination.")
+
+    # ── Training images: original + N augmented variants ─────────────
+    for idx, src_path in enumerate(train_imgs):
         try:
             img = Image.open(src_path).convert("RGB")
             img = _preresize(img)
         except Exception as e:
             print(f"    skipping {src_path.name}: {e}")
             continue
-
-        img.save(out_dir / f"{idx:05d}_orig.jpg", "JPEG", quality=92)
-
+        img.save(train_out / f"{idx:05d}_orig.jpg", "JPEG", quality=92)
         for v in range(variants):
-            seed = hash((src_path.name, v)) & 0xFFFFFFFF
+            seed_v = hash((src_path.name, v)) & 0xFFFFFFFF
             try:
-                aug = augment_once(img, seed=seed)
-                aug.save(out_dir / f"{idx:05d}_aug{v}.jpg", "JPEG",
-                         quality=random.Random(seed).randint(70, 95))
+                aug = augment_once(img, seed=seed_v)
+                aug.save(train_out / f"{idx:05d}_aug{v}.jpg", "JPEG",
+                         quality=random.Random(seed_v).randint(70, 95))
             except Exception as e:
                 print(f"    aug failed {src_path.name} v{v}: {e}")
+
+    # ── Validation images: raw originals only, NO augmentation ───────
+    for idx, src_path in enumerate(val_imgs):
+        try:
+            img = Image.open(src_path).convert("RGB")
+            img = _preresize(img)
+        except Exception as e:
+            print(f"    skipping {src_path.name}: {e}")
+            continue
+        img.save(val_out / f"{idx:05d}_orig.jpg", "JPEG", quality=92)
 
 
 def preview_augmentations(image_path, count=16, output_path="preview.png"):
@@ -411,6 +455,11 @@ def main():
     ap.add_argument("--input_dir", type=Path)
     ap.add_argument("--output_dir", type=Path)
     ap.add_argument("--variants", type=int, default=12)  # was 8
+    ap.add_argument("--val_split", type=float, default=0.2,
+                    help="Fraction of SOURCE images per class held out for "
+                         "validation (split before augmentation — leak-free).")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Seed for the deterministic train/val split.")
     ap.add_argument("--preview", type=Path)
     args = ap.parse_args()
 
@@ -421,17 +470,27 @@ def main():
     if args.input_dir is None or args.output_dir is None:
         ap.error("--input_dir and --output_dir are required.")
 
+    if not 0.0 < args.val_split < 0.9:
+        ap.error("--val_split must be between 0 and 0.9")
+
     if args.output_dir.exists():
         print(f"Removing existing {args.output_dir}")
         shutil.rmtree(args.output_dir)
-    args.output_dir.mkdir(parents=True)
+    train_root = args.output_dir / "train"
+    val_root = args.output_dir / "val"
+    train_root.mkdir(parents=True)
+    val_root.mkdir(parents=True)
 
     class_dirs = sorted(p for p in args.input_dir.iterdir() if p.is_dir())
     print(f"Found {len(class_dirs)} classes, {args.variants} variants each.")
+    print(f"Val split: {args.val_split:.0%} of SOURCE images, held out "
+          f"BEFORE augmentation (no leakage).")
     print(f"Pre-resize to {MAX_SIDE} px on long edge for speed.\n")
     for cd in class_dirs:
-        process_class(cd, args.output_dir / cd.name, variants=args.variants)
-    print("\nDone.")
+        process_class(cd, train_root / cd.name, val_root / cd.name,
+                      variants=args.variants, val_split=args.val_split,
+                      seed=args.seed)
+    print(f"\nDone.\n  train -> {train_root}\n  val   -> {val_root}")
 
 
 if __name__ == "__main__":

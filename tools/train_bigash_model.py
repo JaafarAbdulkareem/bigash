@@ -30,6 +30,15 @@ Output:
     labels.txt          class names in the same order as model output
     stage1_best.keras   intermediate snapshots (loaded back in Colab for export)
     stage2_best.keras
+
+PREPROCESSING CONTRACT (do not break):
+  - --data_dir must contain pre-split train/ and val/ subfolders, produced by
+    augment_dataset.py v5+. That script splits source images BEFORE
+    augmenting, which is what keeps val accuracy honest (no leakage).
+  - Images load with crop_to_aspect_ratio=True (center-crop to square). This
+    must stay identical to the Flutter app's TFLiteService, which center-crops
+    every camera frame the same way. Change one side without the other and
+    every prediction in production is geometrically wrong.
 """
 
 from __future__ import annotations
@@ -52,18 +61,42 @@ MODEL_FILENAME = "bigash_v18.tflite"
 # Dataset loading
 # ──────────────────────────────────────────────────────────────────────
 
-def build_datasets(data_dir, val_split=0.2):
+def build_datasets(data_dir):
+    """Load the pre-split train/ and val/ subfolders produced by
+    augment_dataset.py (v5+). The split is done there, on source images
+    before augmentation, so there is NO train/val leakage here.
+
+    crop_to_aspect_ratio=True center-crops each image to a square before
+    resizing to 224x224. This MUST match the Flutter app: TFLiteService
+    center-crops every camera frame the same way. A mismatch silently
+    mis-classifies every frame in production."""
+    data_dir = pathlib.Path(data_dir)
+    train_dir = data_dir / "train"
+    val_dir = data_dir / "val"
+    if not train_dir.is_dir() or not val_dir.is_dir():
+        raise SystemExit(
+            f"Expected '{train_dir}' and '{val_dir}'.\n"
+            f"Run augment_dataset.py (v5+) first — it now writes train/ and "
+            f"val/ subfolders into the output directory.")
+
     train_ds = tf.keras.utils.image_dataset_from_directory(
-        data_dir, validation_split=val_split, subset="training", seed=SEED,
+        train_dir, seed=SEED,
         image_size=(IMG_SIZE, IMG_SIZE), batch_size=BATCH_SIZE,
         label_mode="categorical", shuffle=True,
+        crop_to_aspect_ratio=True,
     )
     val_ds = tf.keras.utils.image_dataset_from_directory(
-        data_dir, validation_split=val_split, subset="validation", seed=SEED,
+        val_dir, seed=SEED,
         image_size=(IMG_SIZE, IMG_SIZE), batch_size=BATCH_SIZE,
-        label_mode="categorical", shuffle=True,
+        label_mode="categorical", shuffle=False,
+        crop_to_aspect_ratio=True,
     )
     class_names = train_ds.class_names
+    if val_ds.class_names != class_names:
+        raise SystemExit(
+            f"Class mismatch between train and val:\n"
+            f"  train: {class_names}\n  val:   {val_ds.class_names}\n"
+            f"Every class needs images on both sides of the split.")
     print(f"Detected classes: {class_names}")
     return train_ds, val_ds, class_names
 
@@ -143,14 +176,15 @@ def augment_pipeline(images, labels):
 
 
 def prepare_datasets(train_ds, val_ds):
-    # Conservative pipeline — Kaggle's process is OOM-killed if total RAM
-    # spikes past ~30 GB. AUTOTUNE was opening too many parallel workers
-    # that each held an in-flight batch in memory. Fixed small values keep
-    # the working set bounded.
-    train_ds = train_ds.shuffle(500)                                  # was 2000
-    train_ds = train_ds.map(augment_pipeline, num_parallel_calls=2)   # was AUTOTUNE
-    train_ds = train_ds.prefetch(2)                                   # was AUTOTUNE
-    val_ds = val_ds.prefetch(2)                                       # was AUTOTUNE
+    # Memory-bounded pipeline. The dataset is already BATCHED (batch_size=16),
+    # so shuffle(N) buffers N*16 decoded 224x224x3 float32 images. shuffle(500)
+    # was ~4.5 GB and OOM-kills the process on a ~12 GB Colab runtime. 32
+    # batches (~300 MB) is plenty — image_dataset_from_directory already
+    # reshuffles the file list every epoch, so global shuffling is covered.
+    train_ds = train_ds.shuffle(32)                                   # was 500 (OOM)
+    train_ds = train_ds.map(augment_pipeline, num_parallel_calls=2)
+    train_ds = train_ds.prefetch(2)
+    val_ds = val_ds.prefetch(2)
     return train_ds, val_ds
 
 
@@ -250,13 +284,14 @@ def cosine_schedule(initial_lr, total_steps, warmup_steps):
     )
 
 
-def compute_class_weights(data_dir, class_names):
+def compute_class_weights(train_dir, class_names):
     """Inverse-frequency class weights, normalised to mean=1.0.
-    Boosts rare classes; 'other' gets an extra +20% to discourage
-    false-positive currency announcements."""
+    Counts come from the TRAINING split only. Boosts rare classes;
+    'other' gets an extra +20% to discourage false-positive currency
+    announcements."""
     counts = []
     for c in class_names:
-        d = pathlib.Path(data_dir) / c
+        d = pathlib.Path(train_dir) / c
         counts.append(len([p for p in d.iterdir() if p.is_file()]))
     counts = np.array(counts, dtype=np.float64)
     weights = counts.mean() / counts
@@ -290,7 +325,7 @@ def train(data_dir, output_dir, head_epochs, finetune_epochs,
     print(f"\n🧠 Backbone: {backbone_name}")
     print(f"📊 Steps per epoch: {steps_per_epoch}")
 
-    class_weight = compute_class_weights(data_dir, class_names)
+    class_weight = compute_class_weights(pathlib.Path(data_dir) / "train", class_names)
     print(f"⚖️ Class weights: { {class_names[i]: round(v, 2) for i, v in class_weight.items()} }")
 
     # ── Stage 1: classification head only ────────────────────────────
@@ -379,20 +414,20 @@ def _print_confusion_matrix(cm, class_names):
 # TFLite export — uses the working concrete-function path
 # ──────────────────────────────────────────────────────────────────────
 
-def export_tflite(model, class_names, output_dir, quantize):
+def export_tflite(model, class_names, output_dir, quantize, backbone_name):
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build a serving function with a fixed [1, 224, 224, 3] signature.
-    # This avoids the from_keras_model bug on TF 2.16+/Keras 3 and is
-    # the same path that worked in our Colab rescue cell.
-    @tf.function(input_signature=[
-        tf.TensorSpec(shape=[1, IMG_SIZE, IMG_SIZE, 3], dtype=tf.float32)
-    ])
-    def serving_fn(x):
-        return model(x, training=False)
+    # Training runs under a mixed_float16 policy, so the trained model's
+    # compute graph is float16. TFLite's builtin converter cannot lower
+    # float16 Conv2D/Relu6/Mul/etc. and fails with ERROR_NEEDS_FLEX_OPS.
+    # Mixed precision keeps the *weights* in float32, so we rebuild the
+    # architecture under a pure float32 policy, copy the trained weights
+    # in, and convert that clean float32 graph instead.
+    tf.keras.mixed_precision.set_global_policy("float32")
+    fp32_model, _ = build_model(len(class_names), backbone_name)
+    fp32_model.set_weights(model.get_weights())
 
-    concrete = serving_fn.get_concrete_function()
-    converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete], model)
+    converter = tf.lite.TFLiteConverter.from_keras_model(fp32_model)
 
     if quantize == "fp16":
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -464,7 +499,7 @@ def main():
     if not args.skip_export:
         try:
             export_tflite(model, class_names, args.output_dir,
-                          quantize=args.quantize)
+                          quantize=args.quantize, backbone_name=args.backbone)
         except Exception as e:
             print(f"\n⚠️ Export to TFLite failed: {e}")
             print("   Keras checkpoints saved in output dir — convert in Colab.")
