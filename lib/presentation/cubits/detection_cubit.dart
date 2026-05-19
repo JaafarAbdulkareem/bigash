@@ -99,26 +99,36 @@ class DetectionCubit extends Cubit<DetectionState> {
   DateTime? _cooldownUntil;
   bool _canVibrate = false;
   bool _torchOn = false;
+  /// When the last spoken reposition hint played — throttles hint speech
+  /// so it guides the user without talking over every frame.
+  DateTime? _lastHintAt;
+  /// When the last confident frame was voted — used to suppress hints
+  /// while the app is actively detecting.
+  DateTime? _lastVoteAt;
+  /// When "العملة غير معروفة" was last announced — throttles it so the app
+  /// states it once rather than nagging.
+  DateTime? _lastOtherAnnounceAt;
 
-  /// Minimum confidence for a currency-class frame to count as a vote.
-  /// Deliberately strict: this is a money app for blind users, so a
-  /// confidently-wrong announcement is far worse than a slower one. Frames
-  /// below this turn the torch on and ask the user to reposition the bill
-  /// instead of voting.
-  static const double _currencyThreshold = 0.55;
-  /// Minimum confidence for an "other" frame to count as a vote.
-  static const double _otherThreshold = 0.55;
-  /// The top prediction must beat the runner-up by at least this margin to
-  /// count as a confident vote. This wide margin is the main guard against
-  /// confusing visually-similar denominations (e.g. y200 vs y250): an
-  /// ambiguous frame turns the torch on rather than voting either way.
-  static const double _voteMargin = 0.15;
+  /// Noise floor for a currency-class frame to count as a vote. This model
+  /// is trained with label smoothing + MixUp, so its softmax is very soft —
+  /// a correct top class often sits around 0.35-0.55, not 0.9+. So the
+  /// absolute value is NOT the real signal: the announced class is simply
+  /// the highest-probability one, and what guards against a wrong
+  /// announcement is [_voteMargin] (a clear lead over the runner-up) plus
+  /// the voting window (it must stay the winner across several frames).
+  static const double _currencyThreshold = 0.35;
+  /// Noise floor for an "other" frame — slightly lower, since a foreign
+  /// note's own "other" score is also soft (~0.3-0.5).
+  static const double _otherThreshold = 0.28;
+  /// The top class must beat the runner-up by at least this margin to count
+  /// as a vote. This is the PRIMARY confidence gate for this soft model — it
+  /// blocks a genuine near-tie (e.g. other 29% vs y50 20%) from voting.
+  static const double _voteMargin = 0.10;
   /// Number of recent frames we remember for majority voting.
-  static const int _voteWindowSize = 12;
-  /// How many of those frames must agree to announce the bill. Combined with
-  /// the confidence and margin gates above, requiring 5 of 12 makes a wrong
-  /// announcement very unlikely while still confirming within a few seconds.
-  static const int _requiredMatches = 5;
+  static const int _voteWindowSize = 10;
+  /// How many of those frames must agree to announce. 3 keeps confirmation
+  /// quick while still rejecting a stray wrong frame.
+  static const int _requiredMatches = 3;
   static const Duration _speechCooldown = Duration(seconds: 3);
 
   bool get _inCooldown =>
@@ -128,6 +138,11 @@ class DetectionCubit extends Cubit<DetectionState> {
     if (state.isActive) {
       return;
     }
+
+    // Tapping to start cuts off the intro guidance immediately and confirms
+    // out loud that scanning has begun — speak() stops in-progress speech
+    // first, so the intro is interrupted the moment the user taps.
+    unawaited(_ttsService.speak('بدأ المسح. وجّه الكاميرا نحو العملة.'));
 
     if (!state.isInitialized) {
       await _repository.initialize();
@@ -151,6 +166,8 @@ class DetectionCubit extends Cubit<DetectionState> {
 
     _voteWindow.clear();
     _cooldownUntil = null;
+    _lastVoteAt = null;
+    _lastOtherAnnounceAt = null;
     _cooldownTimer?.cancel();
     _canVibrate = await Vibration.hasVibrator();
 
@@ -194,6 +211,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     );
 
     _startPulsingVibration();
+    _lastHintAt = DateTime.now();
 
     await _currencySubscription?.cancel();
     _currencySubscription =
@@ -230,6 +248,29 @@ class DetectionCubit extends Cubit<DetectionState> {
     await _repository.setTorchEnabled(on);
   }
 
+  /// Spoken when the scanner screen first opens — the screen is otherwise
+  /// silent, so a blind user needs to be told what to do.
+  Future<void> announceIntro() async {
+    if (state.isActive) {
+      return;
+    }
+    await _ttsService.speak(
+      'شاشة التعرف على العملة جاهزة. اضغط في أي مكان على الشاشة لبدء المسح.',
+    );
+  }
+
+  /// Speaks a reposition hint, throttled to once every 12 seconds so it
+  /// guides the user calmly instead of repeating annoyingly.
+  void _maybeSpeakHint(String hint) {
+    final DateTime now = DateTime.now();
+    if (_lastHintAt != null &&
+        now.difference(_lastHintAt!) < const Duration(seconds: 12)) {
+      return;
+    }
+    _lastHintAt = now;
+    unawaited(_ttsService.speak(hint));
+  }
+
   String _buildDebugText(CurrencyEntity entity) {
     if (entity.topK.isEmpty) {
       return '${entity.label} ${(entity.confidence * 100).toStringAsFixed(0)}%';
@@ -262,12 +303,33 @@ class DetectionCubit extends Cubit<DetectionState> {
     final bool hasMargin = _hasMargin(entity);
 
     if (isIgnoredYemeniCurrencyLabel(key)) {
-      // Strong, decisive "other" = silent scanning (no torch, no alarm).
-      // The user is pointing at a foreign bill / hand / paper, which is a
-      // valid state — don't bombard them with feedback.
       if (entity.confidence >= _otherThreshold && hasMargin) {
-        _pushVote(key);
         unawaited(_setTorch(false));
+        _pushVote(key);
+        final String? winner = _majorityWinner();
+        if (winner != null && winner == key) {
+          // Decisively "not a Yemeni bill". Say so once, then stay quiet
+          // for a while so the app does not nag.
+          _voteWindow.clear();
+          final DateTime now = DateTime.now();
+          final bool tellUser = _lastOtherAnnounceAt == null ||
+              now.difference(_lastOtherAnnounceAt!) >
+                  const Duration(seconds: 12);
+          if (tellUser) {
+            _lastOtherAnnounceAt = now;
+            _cooldownUntil = now.add(_speechCooldown);
+            _stopPulsingVibration();
+            emit(
+              state.copyWith(
+                phase: CurrencyDetectionPhase.success,
+                statusText: 'العملة غير معروفة',
+                debugText: debugText,
+              ),
+            );
+            unawaited(_finishSuccessAnnouncement('العملة غير معروفة'));
+            return;
+          }
+        }
         emit(
           state.copyWith(
             phase: CurrencyDetectionPhase.scanning,
@@ -276,32 +338,41 @@ class DetectionCubit extends Cubit<DetectionState> {
           ),
         );
       } else {
-        // Ambiguous: top is "other" but confidence < 0.55 or close to next
-        // class. Could be a poorly-lit currency bill. Torch on to help.
+        // Genuinely unsure. Guide the user — unless a confident frame was
+        // just voted, in which case a hint would only confuse.
         unawaited(_setTorch(true));
+        const String hint = 'حاول تقريب العملة وثبّتها أمام الكاميرا';
         emit(
           state.copyWith(
             phase: CurrencyDetectionPhase.lowLight,
-            statusText: 'حاول تقريب العملة وثبّتها أمام الكاميرا',
+            statusText: hint,
             debugText: debugText,
           ),
         );
+        if (!_detectingRecently()) {
+          _maybeSpeakHint(hint);
+        }
       }
       return;
     }
 
     if (entity.confidence <= _currencyThreshold || !hasMargin) {
       // Currency suspected but not confident. Could be: low light, bad
-      // angle, hand shaking, or the bill is partially out of frame.
-      // Torch on to help — light fixes most of these.
+      // angle, hand shaking, or the bill is partially out of frame. Torch
+      // on to help; speak the hint only if we are not already mid-detection
+      // (a confident frame was just voted) — otherwise it just confuses.
       unawaited(_setTorch(true));
+      const String hint = 'ثبّت يدك واقترب من العملة';
       emit(
         state.copyWith(
           phase: CurrencyDetectionPhase.lowLight,
-          statusText: 'ثبّت يدك واقترب من العملة',
+          statusText: hint,
           debugText: debugText,
         ),
       );
+      if (!_detectingRecently()) {
+        _maybeSpeakHint(hint);
+      }
       return;
     }
 
@@ -326,22 +397,28 @@ class DetectionCubit extends Cubit<DetectionState> {
       return;
     }
 
-    final int matches = _voteWindow.where((v) => v == key).length;
     emit(
       state.copyWith(
         phase: CurrencyDetectionPhase.scanning,
-        statusText: 'جاري التحقق $matches من $_requiredMatches',
+        statusText: 'جاري المسح',
         debugText: debugText,
       ),
     );
   }
 
   void _pushVote(String label) {
+    _lastVoteAt = DateTime.now();
     _voteWindow.add(label);
     if (_voteWindow.length > _voteWindowSize) {
       _voteWindow.removeAt(0);
     }
   }
+
+  /// True if a confident frame was voted within the last few seconds — the
+  /// app is mid-detection, so a "reposition" hint would only confuse.
+  bool _detectingRecently() =>
+      _lastVoteAt != null &&
+      DateTime.now().difference(_lastVoteAt!) < const Duration(seconds: 3);
 
   /// Returns the label that appears at least [_requiredMatches] times in the
   /// current voting window, or null if no label reaches the threshold.
@@ -437,7 +514,9 @@ class DetectionCubit extends Cubit<DetectionState> {
     await Future<void>.delayed(Duration.zero);
 
     await _repository.stopCamera();
-    await _ttsService.stop();
+    // Tell the blind user out loud that scanning has stopped — speak()
+    // first cuts any announcement that was still playing.
+    await _ttsService.speak('تم إيقاف التعرف. اضغط على الشاشة لإعادة التشغيل.');
   }
 
   Future<void> toggle() async {

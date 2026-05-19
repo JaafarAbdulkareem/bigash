@@ -24,6 +24,13 @@ class _ScannerPageState extends State<ScannerPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // The scanner screen is silent until tapped — once the first frame is
+    // drawn, tell the blind user out loud what to do.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        context.read<DetectionCubit>().announceIntro();
+      }
+    });
   }
 
   @override
@@ -145,6 +152,26 @@ class _ScannerPageState extends State<ScannerPage>
                       CameraPreview(controller)
                     else
                       const ColoredBox(color: Colors.black),
+                    // Live top-3 readout — invisible to a blind user; kept
+                    // for field calibration of the voting thresholds.
+                    if (mlState.isActive && mlState.debugText.isNotEmpty)
+                      Align(
+                        alignment: Alignment.topCenter,
+                        child: Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.fromLTRB(12, 48, 12, 12),
+                          color: Colors.black.withValues(alpha: 0.55),
+                          child: Text(
+                            mlState.debugText,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.cyanAccent,
+                              fontSize: 16,
+                              fontFamily: 'monospace',
+                            ),
+                          ),
+                        ),
+                      ),
                     Align(
                       alignment: Alignment.bottomCenter,
                       child: Container(

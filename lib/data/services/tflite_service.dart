@@ -40,11 +40,11 @@ class TFLiteService {
   /// raw [0, 255] float32 pixel values — no Flutter-side normalization.
   NormalizationMode normalization = NormalizationMode.raw;
 
-  /// Test-time augmentation: average inference over 4 rotations. Off by
-  /// default — the model is already trained with 90/180/270 rotation
-  /// augmentation, and running 4 inferences per frame noticeably slows the
-  /// scan. Flip to true only if field testing shows rotated bills are missed.
-  bool useTTA = false;
+  /// Test-time augmentation: average inference over 4 rotations. ON — the
+  /// model is trained with label smoothing + MixUp, so its softmax is soft;
+  /// averaging rotations lifts the confidence enough that good frames
+  /// actually clear the voting threshold. Worth the 4x inference cost.
+  bool useTTA = true;
 
   Interpreter? _interpreter;
   List<String> _labels = <String>[];
