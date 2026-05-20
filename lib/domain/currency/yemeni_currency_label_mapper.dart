@@ -12,7 +12,8 @@ bool isIgnoredYemeniCurrencyLabel(String normalized) {
       normalized == '1_other';
 }
 
-/// Clear Arabic for TTS (Yemeni riyal denominations).
+/// Clear Arabic for TTS (Yemeni riyal denominations). Plain, unvoweled text:
+/// adding tashkeel marks made device TTS engines read it incorrectly.
 String arabicTtsForYemeniBill(String normalized) {
   switch (normalized) {
     case 'y50':

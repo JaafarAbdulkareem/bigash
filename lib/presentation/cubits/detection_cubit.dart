@@ -99,6 +99,10 @@ class DetectionCubit extends Cubit<DetectionState> {
   DateTime? _cooldownUntil;
   bool _canVibrate = false;
   bool _torchOn = false;
+  /// Guards start()/stop() against re-entry — a rapid double-tap could
+  /// otherwise run two camera start/stop cycles at once and end up using a
+  /// disposed CameraController.
+  bool _transitioning = false;
   /// When the last spoken reposition hint played — throttles hint speech
   /// so it guides the user without talking over every frame.
   DateTime? _lastHintAt;
@@ -520,10 +524,21 @@ class DetectionCubit extends Cubit<DetectionState> {
   }
 
   Future<void> toggle() async {
-    if (state.isActive) {
-      await stop();
-    } else {
-      await start();
+    // Ignore taps that arrive while a previous start/stop is still running —
+    // re-entry races two camera lifecycles and crashes on a disposed
+    // CameraController.
+    if (_transitioning) {
+      return;
+    }
+    _transitioning = true;
+    try {
+      if (state.isActive) {
+        await stop();
+      } else {
+        await start();
+      }
+    } finally {
+      _transitioning = false;
     }
   }
 

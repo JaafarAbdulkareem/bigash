@@ -26,12 +26,13 @@ class TTSService {
       // speaker). A genuine male voice — if the device has one installed —
       // is selected below instead.
       await _flutterTts.setPitch(1.0);
-      await _flutterTts.setSpeechRate(0.48);
+      // A touch brisker — 0.48 felt slow. Still clear for a blind user.
+      await _flutterTts.setSpeechRate(0.6);
       await _flutterTts.awaitSpeakCompletion(true);
       _initialized = true;
 
-      // Best-effort: pick an explicitly male Arabic voice when one exists.
-      await _trySelectMaleArabicVoice();
+      // List the device's Arabic voices and select a male one if present.
+      await _setupArabicVoice();
 
       // setLanguage() does not throw when no Arabic voice is installed —
       // it just yields silent or mispronounced speech. Verify explicitly,
@@ -55,36 +56,33 @@ class TTSService {
     }
   }
 
-  /// Picks an Arabic voice that is explicitly male when the platform
-  /// exposes one. If the device only ships a female Arabic voice, no app
-  /// setting can synthesise a male one — the lowered pitch is then the best
-  /// available, and the user must install a male Arabic voice on the device.
-  Future<void> _trySelectMaleArabicVoice() async {
+  /// Selects the male Arabic voice. 'ar-xa-x-are' is the confirmed male
+  /// Google Arabic voice on the target devices; the offline (local) variant
+  /// is preferred so the app speaks without an internet connection.
+  Future<void> _setupArabicVoice() async {
     try {
       final dynamic voices = await _flutterTts.getVoices;
       if (voices is! List) return;
-      for (final dynamic v in voices) {
-        if (v is! Map) continue;
-        final String locale = '${v['locale'] ?? ''}'.toLowerCase();
-        if (!locale.startsWith('ar')) continue;
-        // Engines expose gender in the name, a gender field, or the
-        // identifier — check whatever is present.
-        final String blob =
-            ('${v['name'] ?? ''} ${v['gender'] ?? ''} ${v['identifier'] ?? ''}')
-                .toLowerCase();
-        debugPrint('[TTS] arabic voice available: $blob');
-        if (blob.contains('male') && !blob.contains('female')) {
-          await _flutterTts.setVoice(<String, String>{
-            'name': '${v['name']}',
-            'locale': '${v['locale']}',
-          });
-          debugPrint('[TTS] male Arabic voice selected: ${v['name']}');
-          return;
+      const List<String> preferred = <String>[
+        'ar-xa-x-are-local',
+        'ar-xa-x-are-network',
+      ];
+      for (final String wanted in preferred) {
+        for (final dynamic v in voices) {
+          if (v is! Map) continue;
+          if ('${v['name'] ?? ''}' == wanted) {
+            await _flutterTts.setVoice(<String, String>{
+              'name': '${v['name']}',
+              'locale': '${v['locale']}',
+            });
+            debugPrint('[TTS] male Arabic voice set: $wanted');
+            return;
+          }
         }
       }
-      debugPrint('[TTS] no male Arabic voice on this device — pitch only');
+      debugPrint('[TTS] male voice ar-xa-x-are not found — using default');
     } catch (e) {
-      debugPrint('[TTS] male-voice selection skipped: $e');
+      debugPrint('[TTS] voice setup skipped: $e');
     }
   }
 
