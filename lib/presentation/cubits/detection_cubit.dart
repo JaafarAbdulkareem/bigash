@@ -304,14 +304,18 @@ class DetectionCubit extends Cubit<DetectionState> {
 
     final String debugText = _buildDebugText(entity);
     final String key = normalizeYemeniClassifierLabel(entity.label);
+    // Vote on the parent denomination, not the design variant, so frames
+    // that flip between y100_new and y100_old on the same bill still
+    // accumulate toward a single announcement.
+    final String voteKey = denominationGroupForVoting(key);
     final bool hasMargin = _hasMargin(entity);
 
     if (isIgnoredYemeniCurrencyLabel(key)) {
       if (entity.confidence >= _otherThreshold && hasMargin) {
         unawaited(_setTorch(false));
-        _pushVote(key);
+        _pushVote(voteKey);
         final String? winner = _majorityWinner();
-        if (winner != null && winner == key) {
+        if (winner != null && winner == voteKey) {
           // Decisively "not a Yemeni bill". Say so once, then stay quiet
           // for a while so the app does not nag.
           _voteWindow.clear();
@@ -381,10 +385,10 @@ class DetectionCubit extends Cubit<DetectionState> {
     }
 
     unawaited(_setTorch(false));
-    _pushVote(key);
+    _pushVote(voteKey);
 
     final String? winner = _majorityWinner();
-    if (winner != null && winner == key) {
+    if (winner != null && winner == voteKey) {
       final String spoken = entity.displayName;
       _voteWindow.clear();
       _cooldownUntil = DateTime.now().add(_speechCooldown);

@@ -48,6 +48,14 @@ void main() {
       expect(arabicTtsForYemeniBill('y1000'), 'ألف ريال يمني');
     });
 
+    test('new/old sub-classes share the spoken phrase of the denomination', () {
+      // The user cannot distinguish bill design — only the value matters.
+      expect(arabicTtsForYemeniBill('y100_new'), 'مائة ريال يمني');
+      expect(arabicTtsForYemeniBill('y100_old'), 'مائة ريال يمني');
+      expect(arabicTtsForYemeniBill('y200_new'), 'مائتان ريال يمني');
+      expect(arabicTtsForYemeniBill('y200_old'), 'مائتان ريال يمني');
+    });
+
     test('falls back to the raw label for unknown input', () {
       expect(arabicTtsForYemeniBill('xyz'), 'xyz');
     });
@@ -58,5 +66,24 @@ void main() {
     expect(key, 'y1000');
     expect(isIgnoredYemeniCurrencyLabel(key), isFalse);
     expect(arabicTtsForYemeniBill(key), 'ألف ريال يمني');
+  });
+
+  group('denominationGroupForVoting', () {
+    test('collapses 100 and 200 design variants to the parent denomination', () {
+      expect(denominationGroupForVoting('y100_new'), 'y100');
+      expect(denominationGroupForVoting('y100_old'), 'y100');
+      expect(denominationGroupForVoting('y200_new'), 'y200');
+      expect(denominationGroupForVoting('y200_old'), 'y200');
+    });
+
+    test('passes single-design denominations through unchanged', () {
+      for (final String label in <String>['y50', 'y250', 'y500', 'y1000']) {
+        expect(denominationGroupForVoting(label), label, reason: label);
+      }
+    });
+
+    test('passes non-currency labels through unchanged', () {
+      expect(denominationGroupForVoting('other'), 'other');
+    });
   });
 }
