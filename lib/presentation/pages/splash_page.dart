@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:vibration/vibration.dart';
 import 'package:bigash/data/services/tts_service.dart';
@@ -16,6 +17,12 @@ class SplashPage extends StatefulWidget {
 
 class _SplashPageState extends State<SplashPage> {
   bool _waitingForPermission = false;
+  /// True while a `Permission.camera.request()` is in flight. Without this
+  /// guard a fast double-tap on "Retry" fires a second request before the
+  /// first dialog dismisses, and the plugin throws:
+  ///   PlatformException(PermissionHandler.PermissionManager,
+  ///     A request for permissions is already running...)
+  bool _requestingPermission = false;
   String _status = 'مرحبا بك في تطبيق بقش';
 
   @override
@@ -26,7 +33,11 @@ class _SplashPageState extends State<SplashPage> {
 
   Future<void> _initAndRoute() async {
     await widget.ttsService.initialize();
-    await widget.ttsService.speak('مرحبا بك في تطبيق بقش');
+    // The visible name is "بقش" but TTS engines mispronounce it (the leading
+    // sukun is not articulable, so the engine garbles or speeds through it).
+    // Spelling it "بيقش" in the spoken string yields the intended Yemeni
+    // pronunciation reliably — the يـ gives the engine an /iː/ vowel anchor.
+    await widget.ttsService.speak('مرحبا بك في تطبيق بيقش');
 
     final bool granted = await _ensureCameraPermission();
     if (!granted) {
@@ -58,7 +69,22 @@ class _SplashPageState extends State<SplashPage> {
     if (status.isGranted) {
       return true;
     }
-    status = await Permission.camera.request();
+    // Re-entrancy guard: if another request is already in flight (e.g. a
+    // rapid second tap on the Retry surface), do not fire a parallel one
+    // — the plugin throws if it sees two requests overlap.
+    if (_requestingPermission) {
+      return false;
+    }
+    _requestingPermission = true;
+    try {
+      status = await Permission.camera.request();
+    } on PlatformException {
+      // Shouldn't happen now that we guard above, but if the OS races us
+      // anyway, treat it as "not granted yet" and let the user retry.
+      return false;
+    } finally {
+      _requestingPermission = false;
+    }
     return status.isGranted;
   }
 
@@ -104,7 +130,9 @@ class _SplashPageState extends State<SplashPage> {
           child: Semantics(
             label: _waitingForPermission
                 ? 'إذن الكاميرا مطلوب. اضغط على الشاشة لإعادة المحاولة.'
-                : 'شاشة البداية، جاري تحميل تطبيق بقش',
+                // Spoken by TalkBack/VoiceOver — spell as "بيقش" for the
+                // same reason the TTS string does (see _initAndRoute).
+                : 'شاشة البداية، جاري تحميل تطبيق بيقش',
             button: _waitingForPermission,
             child: Padding(
               padding: const EdgeInsets.all(24),
