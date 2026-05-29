@@ -11,13 +11,13 @@ void main() {
       const MaterialApp(
         home: Scaffold(
           body: Center(
-            child: Text('بيقش\nBigash'),
+            child: Text('بقش\nBigash'),
           ),
         ),
       ),
     );
 
     expect(find.textContaining('Bigash'), findsOneWidget);
-    expect(find.textContaining('بيقش'), findsOneWidget);
+    expect(find.textContaining('بقش'), findsOneWidget);
   });
 }

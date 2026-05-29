@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this app is
 
-**Bigash (بيقش)** is an accessibility app that lets blind and visually-impaired
+**Bigash (بقش)** is an accessibility app that lets blind and visually-impaired
 users identify **Yemeni riyal banknotes** by pointing the phone camera at a
 bill. An on-device TFLite model classifies the denomination; the app announces
 it with Arabic text-to-speech and signals state through vibration and the

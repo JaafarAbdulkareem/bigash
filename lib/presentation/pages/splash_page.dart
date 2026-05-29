@@ -16,7 +16,7 @@ class SplashPage extends StatefulWidget {
 
 class _SplashPageState extends State<SplashPage> {
   bool _waitingForPermission = false;
-  String _status = 'مرحبا بك في تطبيق بيقش';
+  String _status = 'مرحبا بك في تطبيق بقش';
 
   @override
   void initState() {
@@ -26,7 +26,7 @@ class _SplashPageState extends State<SplashPage> {
 
   Future<void> _initAndRoute() async {
     await widget.ttsService.initialize();
-    await widget.ttsService.speak('مرحبا بك في تطبيق بيقش');
+    await widget.ttsService.speak('مرحبا بك في تطبيق بقش');
 
     final bool granted = await _ensureCameraPermission();
     if (!granted) {
@@ -104,7 +104,7 @@ class _SplashPageState extends State<SplashPage> {
           child: Semantics(
             label: _waitingForPermission
                 ? 'إذن الكاميرا مطلوب. اضغط على الشاشة لإعادة المحاولة.'
-                : 'شاشة البداية، جاري تحميل تطبيق بيقش',
+                : 'شاشة البداية، جاري تحميل تطبيق بقش',
             button: _waitingForPermission,
             child: Padding(
               padding: const EdgeInsets.all(24),
@@ -112,7 +112,7 @@ class _SplashPageState extends State<SplashPage> {
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: <Widget>[
                   const Text(
-                    'بيقش\nBigash',
+                    'بقش\nBigash',
                     textAlign: TextAlign.center,
                     style: TextStyle(
                       fontSize: 48,
