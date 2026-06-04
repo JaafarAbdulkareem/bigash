@@ -65,6 +65,44 @@ class _ScannerPageState extends State<ScannerPage>
     }
   }
 
+  /// Color of the full-screen phase border. Invisible to blind users (they
+  /// rely on TTS + haptics) but gives partially-sighted users and helpers
+  /// an instant, peripheral-vision read of the current detection state.
+  /// Kept dark when not actively scanning so the camera preview is unframed.
+  static Color _phaseColor(DetectionState s) {
+    if (!s.isActive) {
+      return Colors.transparent;
+    }
+    switch (s.phase) {
+      case CurrencyDetectionPhase.scanning:
+        return const Color(0xFFFFB300); // amber 600
+      case CurrencyDetectionPhase.lowLight:
+        return const Color(0xFFE53935); // red 600
+      case CurrencyDetectionPhase.success:
+        return const Color(0xFF43A047); // green 600
+      case CurrencyDetectionPhase.idle:
+        return Colors.transparent;
+    }
+  }
+
+  /// Icon shown next to the status bar text. Same purpose as `_phaseColor`:
+  /// instant visual phase cue for partially-sighted users and helpers.
+  static IconData _phaseIcon(DetectionState s) {
+    if (!s.isActive) {
+      return Icons.touch_app_outlined;
+    }
+    switch (s.phase) {
+      case CurrencyDetectionPhase.scanning:
+        return Icons.center_focus_strong_outlined;
+      case CurrencyDetectionPhase.lowLight:
+        return Icons.flashlight_on_outlined;
+      case CurrencyDetectionPhase.success:
+        return Icons.check_circle_outline;
+      case CurrencyDetectionPhase.idle:
+        return Icons.touch_app_outlined;
+    }
+  }
+
   static String _semanticsLabel(DetectionState s) {
     if (!s.isActive) {
       return 'اضغط لتشغيل الكاميرا. ضغط مطوّل لالتقاط صورة الشاشة.';
@@ -152,6 +190,23 @@ class _ScannerPageState extends State<ScannerPage>
                       CameraPreview(controller)
                     else
                       const ColoredBox(color: Colors.black),
+                    // Phase border — 6px frame around the whole screen that
+                    // animates between amber / red / green so partially-
+                    // sighted users and helpers can read the detection state
+                    // at a glance. IgnorePointer keeps the gesture surface
+                    // fully reachable underneath.
+                    IgnorePointer(
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 250),
+                        curve: Curves.easeOut,
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: _phaseColor(mlState),
+                            width: 6,
+                          ),
+                        ),
+                      ),
+                    ),
                     // Live top-3 readout — invisible to a blind user; kept
                     // for field calibration of the voting thresholds.
                     if (mlState.isActive && mlState.debugText.isNotEmpty)
@@ -174,18 +229,52 @@ class _ScannerPageState extends State<ScannerPage>
                       ),
                     Align(
                       alignment: Alignment.bottomCenter,
-                      child: Container(
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 250),
+                        curve: Curves.easeOut,
                         width: double.infinity,
-                        padding: const EdgeInsets.all(20),
-                        color: Colors.black.withValues(alpha: 0.45),
-                        child: Text(
-                          mlState.statusText,
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                            color: Colors.yellow,
-                            fontSize: 28,
-                            fontWeight: FontWeight.bold,
+                        padding: const EdgeInsets.fromLTRB(20, 24, 20, 28),
+                        decoration: BoxDecoration(
+                          // Vertical gradient instead of a flat translucent
+                          // bar — readable over both bright and dark camera
+                          // frames without obscuring the bill.
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: <Color>[
+                              Colors.black.withValues(alpha: 0.0),
+                              Colors.black.withValues(alpha: 0.75),
+                            ],
                           ),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: <Widget>[
+                            // A small phase glyph beside the status — the
+                            // blind user never sees it, but it helps a
+                            // helper or partially-sighted user identify the
+                            // phase faster than reading words.
+                            Icon(
+                              _phaseIcon(mlState),
+                              color: _phaseColor(mlState) == Colors.transparent
+                                  ? Colors.yellow
+                                  : _phaseColor(mlState),
+                              size: 32,
+                            ),
+                            const SizedBox(width: 12),
+                            Flexible(
+                              child: Text(
+                                mlState.statusText,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: Colors.yellow,
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.bold,
+                                  height: 1.2,
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ),

@@ -15,8 +15,20 @@ class SplashPage extends StatefulWidget {
   State<SplashPage> createState() => _SplashPageState();
 }
 
-class _SplashPageState extends State<SplashPage> {
+class _SplashPageState extends State<SplashPage>
+    with SingleTickerProviderStateMixin {
   bool _waitingForPermission = false;
+  /// Drives the entrance fade-in for the splash content. Partially-sighted
+  /// users see "something appeared", blind users are unaffected. Duration
+  /// is short on purpose — we don't want to delay the camera prompt.
+  late final AnimationController _fadeController = AnimationController(
+    duration: const Duration(milliseconds: 650),
+    vsync: this,
+  )..forward();
+  late final Animation<double> _fadeIn = CurvedAnimation(
+    parent: _fadeController,
+    curve: Curves.easeOut,
+  );
   /// True while a `Permission.camera.request()` is in flight. Without this
   /// guard a fast double-tap on "Retry" fires a second request before the
   /// first dialog dismisses, and the plugin throws:
@@ -121,53 +133,109 @@ class _SplashPageState extends State<SplashPage> {
   }
 
   @override
+  void dispose() {
+    _fadeController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: GestureDetector(
         onTap: _waitingForPermission ? _onRetryTap : null,
         behavior: HitTestBehavior.opaque,
-        child: Center(
-          child: Semantics(
-            label: _waitingForPermission
-                ? 'إذن الكاميرا مطلوب. اضغط على الشاشة لإعادة المحاولة.'
-                // Spoken by TalkBack/VoiceOver — spell as "بيقش" for the
-                // same reason the TTS string does (see _initAndRoute).
-                : 'شاشة البداية، جاري تحميل تطبيق بيقش',
-            button: _waitingForPermission,
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: <Widget>[
-                  const Text(
-                    'بقش\nBigash',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 48,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.yellow,
-                    ),
+        // Subtle radial gradient — keeps the black base (high contrast for
+        // low-vision users) while adding a touch of depth around the logo.
+        child: DecoratedBox(
+          decoration: const BoxDecoration(
+            gradient: RadialGradient(
+              center: Alignment(0, -0.2),
+              radius: 0.9,
+              colors: <Color>[
+                Color(0xFF1A1A2E),
+                Colors.black,
+              ],
+            ),
+          ),
+          child: Center(
+            child: Semantics(
+              label: _waitingForPermission
+                  ? 'إذن الكاميرا مطلوب. اضغط على الشاشة لإعادة المحاولة.'
+                  // Spoken by TalkBack/VoiceOver — spell as "بيقش" for the
+                  // same reason the TTS string does (see _initAndRoute).
+                  : 'شاشة البداية، جاري تحميل تطبيق بيقش',
+              button: _waitingForPermission,
+              child: FadeTransition(
+                opacity: _fadeIn,
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: <Widget>[
+                      // Wallet icon caps the logo — purely decorative for the
+                      // sighted; blind users get the spoken welcome instead.
+                      Container(
+                        padding: const EdgeInsets.all(18),
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Colors.yellow.withValues(alpha: 0.12),
+                          border: Border.all(
+                            color: Colors.yellow.withValues(alpha: 0.5),
+                            width: 2,
+                          ),
+                        ),
+                        child: const Icon(
+                          Icons.account_balance_wallet_outlined,
+                          color: Colors.yellow,
+                          size: 56,
+                        ),
+                      ),
+                      const SizedBox(height: 28),
+                      const Text(
+                        'بقش',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 64,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.yellow,
+                          height: 1.0,
+                          letterSpacing: 2,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Bigash',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.w500,
+                          color: Colors.yellow.withValues(alpha: 0.75),
+                          letterSpacing: 4,
+                        ),
+                      ),
+                      const SizedBox(height: 36),
+                      Text(
+                        _status,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          color: Colors.white,
+                          height: 1.4,
+                        ),
+                      ),
+                      if (_waitingForPermission) ...<Widget>[
+                        const SizedBox(height: 32),
+                        const Icon(Icons.touch_app,
+                            color: Colors.yellow, size: 64),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'اضغط لإعادة المحاولة',
+                          style: TextStyle(color: Colors.yellow, fontSize: 16),
+                        ),
+                      ],
+                    ],
                   ),
-                  const SizedBox(height: 24),
-                  Text(
-                    _status,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      fontSize: 18,
-                      color: Colors.white,
-                    ),
-                  ),
-                  if (_waitingForPermission) ...<Widget>[
-                    const SizedBox(height: 32),
-                    const Icon(Icons.touch_app,
-                        color: Colors.yellow, size: 64),
-                    const SizedBox(height: 8),
-                    const Text(
-                      'اضغط لإعادة المحاولة',
-                      style: TextStyle(color: Colors.yellow, fontSize: 16),
-                    ),
-                  ],
-                ],
+                ),
               ),
             ),
           ),
