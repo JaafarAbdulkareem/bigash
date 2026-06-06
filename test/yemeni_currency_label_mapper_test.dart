@@ -42,7 +42,8 @@ void main() {
     test('maps every supported denomination to Arabic speech', () {
       expect(arabicTtsForYemeniBill('y50'), 'خمسون ريال يمني');
       expect(arabicTtsForYemeniBill('y100'), 'مائة ريال يمني');
-      expect(arabicTtsForYemeniBill('y200'), 'مائتان ريال يمني');
+      // "مائتا" not "مائتان": nūn of the dual drops in iḍāfa before the noun.
+      expect(arabicTtsForYemeniBill('y200'), 'مائتا ريال يمني');
       expect(arabicTtsForYemeniBill('y250'), 'مائتان وخمسون ريال يمني');
       expect(arabicTtsForYemeniBill('y500'), 'خمسمائة ريال يمني');
       expect(arabicTtsForYemeniBill('y1000'), 'ألف ريال يمني');
@@ -52,8 +53,25 @@ void main() {
       // The user cannot distinguish bill design — only the value matters.
       expect(arabicTtsForYemeniBill('y100_new'), 'مائة ريال يمني');
       expect(arabicTtsForYemeniBill('y100_old'), 'مائة ريال يمني');
-      expect(arabicTtsForYemeniBill('y200_new'), 'مائتان ريال يمني');
-      expect(arabicTtsForYemeniBill('y200_old'), 'مائتان ريال يمني');
+      expect(arabicTtsForYemeniBill('y200_new'), 'مائتا ريال يمني');
+      expect(arabicTtsForYemeniBill('y200_old'), 'مائتا ريال يمني');
+    });
+
+    test('every label shipped in assets/labels.txt maps to non-empty Arabic '
+        'speech (no raw English token spoken to a blind user)', () {
+      // Safety contract: the 9 classes the model can actually emit must each
+      // resolve to a real Arabic phrase, never fall through to a raw token.
+      const List<String> shipped = <String>[
+        'other', 'y1000', 'y100_new', 'y100_old', 'y200_new', 'y200_old',
+        'y250', 'y50', 'y500',
+      ];
+      for (final String label in shipped) {
+        if (isIgnoredYemeniCurrencyLabel(label)) continue;
+        final String spoken = arabicTtsForYemeniBill(label);
+        expect(spoken, isNot(label),
+            reason: '$label fell through to a verbatim token');
+        expect(spoken.contains('ريال'), isTrue, reason: label);
+      }
     });
 
     test('falls back to the raw label for unknown input', () {

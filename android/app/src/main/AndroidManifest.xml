@@ -1,8 +1,17 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- The torch is controlled through the Camera2 API, which does not
          require the (legacy) FLASHLIGHT permission. -->
+
+    <!-- Strip permissions that bundled plugins (camera, gal, image, etc.)
+         merge in but this offline, audio-free, no-telephony app never uses.
+         Shipping them would be an unjustified privacy ask and a Play Store
+         review flag. enableAudio is false, so RECORD_AUDIO is not needed. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
 
     <!-- Required by the `gal` plugin to save screenshots to the gallery on
          Android 9 and below. Android 10+ uses MediaStore and ignores this. -->
@@ -20,7 +29,9 @@
     <application
         android:label="بقش"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="false"><!-- No user data to back up; disabling avoids leaking any cached state off-device. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"

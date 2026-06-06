@@ -50,10 +50,23 @@ DEFAULT_QUERIES = [
     ("old 100 rupee note india gandhi", 30),
     ("old 50 rupee note india gandhi", 25),
     ("old 20 rupee note india gandhi", 25),
+    # Small / OLD low denominations — the green 5-rupee was a confirmed field
+    # false-positive (read as a Yemeni 200). These were missing from the set
+    # because they are old/rare, but the model must still learn to reject them.
+    ("indian 5 rupee note green", 40),
+    ("old indian 5 rupee note", 30),
+    ("indian 5 rupee note both sides", 25),
+    ("indian 2 rupee note", 25),
+    ("indian 1 rupee note", 25),
+    ("indian 10 rupee note green old", 20),
     # Various angles
     ("indian rupee note held in hand", 25),
     ("indian rupee note on table", 25),
     ("crumpled indian rupee note", 20),
+    # Green foreign notes generally (color is a major confuser for this model)
+    ("green banknote currency closeup", 25),
+    ("pakistan 10 rupee green note", 20),
+    ("bangladesh 2 taka note", 20),
 
     # ── Saudi riyal — both series (very common in Yemen) ──
     ("saudi riyal 500 banknote", 35),

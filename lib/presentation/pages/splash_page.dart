@@ -16,7 +16,7 @@ class SplashPage extends StatefulWidget {
 }
 
 class _SplashPageState extends State<SplashPage>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   bool _waitingForPermission = false;
   /// Drives the entrance fade-in for the splash content. Partially-sighted
   /// users see "something appeared", blind users are unaffected. Duration
@@ -40,16 +40,44 @@ class _SplashPageState extends State<SplashPage>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initAndRoute();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // When the user returns from the system Settings page (where they may have
+    // just granted camera permission), re-check and proceed automatically — a
+    // blind user shouldn't have to guess they must tap the screen again.
+    if (state == AppLifecycleState.resumed && _waitingForPermission) {
+      _recheckPermissionOnResume();
+    }
+  }
+
+  Future<void> _recheckPermissionOnResume() async {
+    final PermissionStatus status = await Permission.camera.status;
+    if (status.isGranted && mounted) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const ScannerPage()),
+      );
+    }
   }
 
   Future<void> _initAndRoute() async {
     await widget.ttsService.initialize();
-    // The visible name is "بقش" but TTS engines mispronounce it (the leading
-    // sukun is not articulable, so the engine garbles or speeds through it).
-    // Spelling it "بيقش" in the spoken string yields the intended Yemeni
-    // pronunciation reliably — the يـ gives the engine an /iː/ vowel anchor.
-    await widget.ttsService.speak('مرحبا بك في تطبيق بيقش');
+    // Audio is the ONLY safe channel for a blind user. If the engine failed to
+    // init or the device has no Arabic voice, denomination announcements would
+    // be silent/garbled — warn loudly (vibration is the reliable cue) instead
+    // of silently promising readiness.
+    if (widget.ttsService.initFailed || !widget.ttsService.arabicVoiceAvailable) {
+      await _warnTtsDegraded();
+    } else {
+      // The visible name is "بقش" but TTS engines mispronounce it (the leading
+      // sukun is not articulable, so the engine garbles or speeds through it).
+      // Spelling it "بيقش" in the spoken string yields the intended Yemeni
+      // pronunciation reliably — the يـ gives the engine an /iː/ vowel anchor.
+      await widget.ttsService.speak('مرحبا بك في تطبيق بيقش');
+    }
 
     final bool granted = await _ensureCameraPermission();
     if (!granted) {
@@ -100,6 +128,27 @@ class _SplashPageState extends State<SplashPage>
     return status.isGranted;
   }
 
+  /// Warns the user (vibration + best-effort speech + on-screen text) that the
+  /// device cannot speak Arabic, so denomination announcements may be silent.
+  /// The vibration is the reliable signal; the speech may itself be silent.
+  Future<void> _warnTtsDegraded() async {
+    if (await Vibration.hasVibrator()) {
+      // Long-short-long: a distinct "something is wrong" pattern, different
+      // from the scanner's short pulses.
+      unawaited(Vibration.vibrate(pattern: <int>[0, 500, 200, 150, 200, 500]));
+    }
+    if (mounted) {
+      setState(() {
+        _status = 'تنبيه: لا يتوفر صوت عربي للنطق على هذا الجهاز. '
+            'ثبّت صوتا عربيا من إعدادات الجهاز لقراءة فئات العملة بوضوح.';
+      });
+    }
+    await widget.ttsService.speak(
+      'تنبيه: لا يوجد صوت عربي للنطق على هذا الجهاز. '
+      'يرجى تثبيت صوت عربي من إعدادات الجهاز لقراءة فئات العملة بوضوح.',
+    );
+  }
+
   Future<void> _alertNeedsPermission() async {
     // Loud audio + strong vibration so a blind user notices even with the
     // phone in their pocket / on a table.
@@ -134,6 +183,7 @@ class _SplashPageState extends State<SplashPage>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _fadeController.dispose();
     super.dispose();
   }

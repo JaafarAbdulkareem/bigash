@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -6,7 +7,10 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:camera/camera.dart';
 import 'package:gal/gal.dart';
+import 'package:vibration/vibration.dart';
 
+import 'package:bigash/core/di/injection_container.dart' as di;
+import 'package:bigash/data/services/tts_service.dart';
 import 'package:bigash/presentation/cubits/detection_cubit.dart';
 
 class ScannerPage extends StatefulWidget {
@@ -119,6 +123,24 @@ class _ScannerPageState extends State<ScannerPage>
     }
   }
 
+  /// Audio + haptic feedback for the screenshot flow. A blind user can't see a
+  /// SnackBar, so every outcome (saved / denied / failed) is also spoken and
+  /// vibrated. Uses the same singleton TTS as the rest of the app.
+  void _screenshotFeedback(String spoken, {bool error = false}) {
+    unawaited(di.sl<TTSService>().speak(spoken));
+    unawaited(
+      Vibration.hasVibrator().then((bool has) {
+        if (has) {
+          Vibration.vibrate(
+            pattern: error
+                ? <int>[0, 300, 150, 300]
+                : <int>[0, 120],
+          );
+        }
+      }),
+    );
+  }
+
   Future<void> _captureScreenshot() async {
     try {
       final RenderRepaintBoundary? boundary = _captureKey.currentContext
@@ -136,6 +158,7 @@ class _ScannerPageState extends State<ScannerPage>
       if (!hasAccess) {
         final bool granted = await Gal.requestAccess();
         if (!granted) {
+          _screenshotFeedback('تم رفض إذن الوصول إلى المعرض', error: true);
           if (!mounted) return;
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('تم رفض إذن الوصول إلى المعرض')),
@@ -148,6 +171,7 @@ class _ScannerPageState extends State<ScannerPage>
           'bigash_${DateTime.now().millisecondsSinceEpoch}';
       await Gal.putImageBytes(pngBytes, album: 'Bigash', name: filename);
 
+      _screenshotFeedback('تم حفظ الصورة في المعرض');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -156,6 +180,7 @@ class _ScannerPageState extends State<ScannerPage>
         ),
       );
     } catch (e) {
+      _screenshotFeedback('فشل التقاط الصورة', error: true);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('فشل الالتقاط: $e')),
@@ -266,6 +291,13 @@ class _ScannerPageState extends State<ScannerPage>
                               child: Text(
                                 mlState.statusText,
                                 textAlign: TextAlign.center,
+                                // Cap lines + ellipsis so a long hint at a
+                                // large accessibility text scale can't overflow
+                                // and break the layout. The status is always
+                                // ALSO spoken, so visual truncation in extreme
+                                // scales is safe.
+                                maxLines: 4,
+                                overflow: TextOverflow.ellipsis,
                                 style: const TextStyle(
                                   color: Colors.yellow,
                                   fontSize: 28,

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:bigash/data/services/tts_service.dart';
+import 'package:bigash/domain/currency/frame_decision.dart';
 import 'package:bigash/domain/currency/yemeni_currency_label_mapper.dart';
 import 'package:bigash/domain/entities/currency_entity.dart';
 import 'package:bigash/domain/repositories/currency_repository.dart';
@@ -92,10 +93,16 @@ class DetectionCubit extends Cubit<DetectionState> {
   Timer? _vibrationPulseTimer;
   Timer? _cooldownTimer;
 
-  /// Rolling window of recent high-confidence label votes for majority voting.
-  /// This is more forgiving than strict consecutive matching for users who
-  /// cannot hold the phone perfectly still (blind users, hand tremors).
-  final List<String> _voteWindow = <String>[];
+  /// Time-bounded majority voter over recent confident frames. The voting math
+  /// (strict majority of a pruned window + deterministic tie-break) lives in
+  /// the pure [MajorityVoter] so it can be unit-tested without plugins.
+  final MajorityVoter _voter = MajorityVoter();
+
+  /// Per-frame confidence / margin / OOD gates. Pure logic in [classifyFrame];
+  /// see frame_decision.dart for what each threshold guards (including the
+  /// out-of-distribution gate that stops a foreign note being read as money).
+  static const DecisionThresholds _thresholds = DecisionThresholds();
+
   DateTime? _cooldownUntil;
   bool _canVibrate = false;
   bool _torchOn = false;
@@ -103,6 +110,12 @@ class DetectionCubit extends Cubit<DetectionState> {
   /// otherwise run two camera start/stop cycles at once and end up using a
   /// disposed CameraController.
   bool _transitioning = false;
+  /// Monotonic scan-session id, bumped on every start()/stop(). A delayed
+  /// callback (e.g. the post-announcement cooldown timer that resumes after an
+  /// awaited TTS call) compares the id it captured against this to detect that
+  /// the session ended/restarted underneath it, and bails out so it cannot
+  /// clobber a freshly-started scan.
+  int _runId = 0;
   /// When the last spoken reposition hint played — throttles hint speech
   /// so it guides the user without talking over every frame.
   DateTime? _lastHintAt;
@@ -113,26 +126,6 @@ class DetectionCubit extends Cubit<DetectionState> {
   /// states it once rather than nagging.
   DateTime? _lastOtherAnnounceAt;
 
-  /// Noise floor for a currency-class frame to count as a vote. This model
-  /// is trained with label smoothing + MixUp, so its softmax is very soft —
-  /// a correct top class often sits around 0.35-0.55, not 0.9+. So the
-  /// absolute value is NOT the real signal: the announced class is simply
-  /// the highest-probability one, and what guards against a wrong
-  /// announcement is [_voteMargin] (a clear lead over the runner-up) plus
-  /// the voting window (it must stay the winner across several frames).
-  static const double _currencyThreshold = 0.35;
-  /// Noise floor for an "other" frame — slightly lower, since a foreign
-  /// note's own "other" score is also soft (~0.3-0.5).
-  static const double _otherThreshold = 0.28;
-  /// The top class must beat the runner-up by at least this margin to count
-  /// as a vote. This is the PRIMARY confidence gate for this soft model — it
-  /// blocks a genuine near-tie (e.g. other 29% vs y50 20%) from voting.
-  static const double _voteMargin = 0.10;
-  /// Number of recent frames we remember for majority voting.
-  static const int _voteWindowSize = 10;
-  /// How many of those frames must agree to announce. 3 keeps confirmation
-  /// quick while still rejecting a stray wrong frame.
-  static const int _requiredMatches = 3;
   static const Duration _speechCooldown = Duration(seconds: 3);
 
   bool get _inCooldown =>
@@ -153,22 +146,32 @@ class DetectionCubit extends Cubit<DetectionState> {
       emit(state.copyWith(isInitialized: true));
     }
 
-    if (!_repository.isModelLoaded) {
+    if (!_repository.isModelReady) {
+      // Either the model file is missing, OR the model and labels.txt disagree
+      // (a contract violation that would otherwise silently mis-map every
+      // denomination). Surface the specific spoken reason when we have one.
+      final String? contractMsg = _repository.modelErrorMessage;
       emit(
         state.copyWith(
           isActive: false,
           phase: CurrencyDetectionPhase.idle,
-          statusText:
+          statusText: contractMsg ??
               'لم يُضف ملف النموذج. ضع ملف tflite في المجلد assets وأعد بناء التطبيق.',
         ),
       );
-      await _ttsService.speak(
-        'لم يُضف نموذج التعرف. أضف ملف النموذج إلى مجلد الأصول ثم أعد تشغيل التطبيق.',
+      // Fire-and-forget: awaiting would hold toggle()'s [_transitioning]
+      // guard for the whole sentence, swallowing a retry tap meanwhile.
+      unawaited(
+        _ttsService.speak(
+          contractMsg ??
+              'لم يُضف نموذج التعرف. أضف ملف النموذج إلى مجلد الأصول ثم أعد تشغيل التطبيق.',
+        ),
       );
       return;
     }
 
-    _voteWindow.clear();
+    _voter.clear();
+    _runId++;
     _cooldownUntil = null;
     _lastVoteAt = null;
     _lastOtherAnnounceAt = null;
@@ -190,9 +193,13 @@ class DetectionCubit extends Cubit<DetectionState> {
           clearCamera: true,
         ),
       );
-      await _ttsService.speak(
-        'تعذّر تشغيل الكاميرا. تأكّد من السماح للتطبيق باستخدام الكاميرا، '
-        'ثم اضغط على الشاشة لإعادة المحاولة.',
+      // Fire-and-forget: awaiting would hold toggle()'s [_transitioning]
+      // guard for the whole sentence, swallowing the retry tap it invites.
+      unawaited(
+        _ttsService.speak(
+          'تعذّر تشغيل الكاميرا. تأكّد من السماح للتطبيق باستخدام الكاميرا، '
+          'ثم اضغط على الشاشة لإعادة المحاولة.',
+        ),
       );
       return;
     }
@@ -248,8 +255,13 @@ class DetectionCubit extends Cubit<DetectionState> {
     if (_torchOn == on) {
       return;
     }
-    _torchOn = on;
-    await _repository.setTorchEnabled(on);
+    // Only update the cached state if the hardware actually accepted the
+    // change, so a failed toggle can't desync the cache (torch stuck on, or the
+    // low-light assist believing it is already on and never retrying).
+    final bool ok = await _repository.setTorchEnabled(on);
+    if (ok) {
+      _torchOn = on;
+    }
   }
 
   /// Spoken when the scanner screen first opens — the screen is otherwise
@@ -284,42 +296,52 @@ class DetectionCubit extends Cubit<DetectionState> {
         .join('  |  ');
   }
 
-  /// True if the top prediction beats the runner-up by [_voteMargin].
-  /// Skips voting on ambiguous frames where two classes are nearly tied
-  /// (e.g. y200=42%, y500=39%) — those frames silently turn the torch on
-  /// and let the user reposition the bill.
-  bool _hasMargin(CurrencyEntity entity) {
-    if (entity.topK.length < 2) {
-      return true; // not enough info; trust the top class
-    }
-    final double top = entity.topK[0].value;
-    final double second = entity.topK[1].value;
-    return (top - second) >= _voteMargin;
-  }
-
   void _onCurrencyEntity(CurrencyEntity entity) {
     if (!state.isActive || _inCooldown) {
       return;
     }
 
     final String debugText = _buildDebugText(entity);
-    final String key = normalizeYemeniClassifierLabel(entity.label);
-    // Vote on the parent denomination, not the design variant, so frames
-    // that flip between y100_new and y100_old on the same bill still
-    // accumulate toward a single announcement.
-    final String voteKey = denominationGroupForVoting(key);
-    final bool hasMargin = _hasMargin(entity);
+    // Group the raw sub-variant top-K (y100_new/y100_old, ...) into parent
+    // denominations BEFORE any gate, so a worn bill splitting its mass across
+    // its two designs isn't read as a near-tie and suppressed. classifyFrame
+    // then applies the confidence/margin/OOD gates — all pure, all tested.
+    final List<MapEntry<String, double>> grouped = groupTopK(
+      entity.topK.isNotEmpty
+          ? entity.topK
+          : <MapEntry<String, double>>[
+              MapEntry<String, double>(entity.label, entity.confidence),
+            ],
+    );
+    final FrameAssessment assessment = classifyFrame(grouped, _thresholds);
+    final DateTime now = DateTime.now();
 
-    if (isIgnoredYemeniCurrencyLabel(key)) {
-      if (entity.confidence >= _otherThreshold && hasMargin) {
+    switch (assessment.verdict) {
+      case FrameVerdict.currency:
         unawaited(_setTorch(false));
-        _pushVote(voteKey);
-        final String? winner = _majorityWinner();
-        if (winner != null && winner == voteKey) {
-          // Decisively "not a Yemeni bill". Say so once, then stay quiet
-          // for a while so the app does not nag.
-          _voteWindow.clear();
-          final DateTime now = DateTime.now();
+        _lastVoteAt = now;
+        _voter.add(assessment.key, now);
+        final String? winner = _voter.winner(now);
+        if (winner != null && winner == assessment.key) {
+          _announceCurrency(winner, debugText, now);
+          return;
+        }
+        emit(
+          state.copyWith(
+            phase: CurrencyDetectionPhase.scanning,
+            statusText: 'جاري المسح',
+            debugText: debugText,
+          ),
+        );
+        return;
+
+      case FrameVerdict.unknown:
+        unawaited(_setTorch(false));
+        _voter.add('other', now);
+        if (_voter.winner(now) == 'other') {
+          // Decisively "not a Yemeni bill". Say so once, then stay quiet for a
+          // while so the app does not nag.
+          _voter.clear();
           final bool tellUser = _lastOtherAnnounceAt == null ||
               now.difference(_lastOtherAnnounceAt!) >
                   const Duration(seconds: 12);
@@ -345,11 +367,18 @@ class DetectionCubit extends Cubit<DetectionState> {
             debugText: debugText,
           ),
         );
-      } else {
-        // Genuinely unsure. Guide the user — unless a confident frame was
-        // just voted, in which case a hint would only confuse.
+        return;
+
+      case FrameVerdict.uncertain:
+        // Low confidence or ambiguous (incl. the OOD case where `other`
+        // competes with the top Yemeni class). Guide the user — unless a
+        // confident frame was just voted, in which case a hint would confuse.
+        // "المسافة" confines the user to the near/far axis only (see the long
+        // rationale that used to live here): no direction word, no side-to-side
+        // motion, no "hold steady" clause that contradicts "change distance",
+        // and no "اقترب" (which this device's TTS misreads).
         unawaited(_setTorch(true));
-        const String hint = 'حاول تقريب العملة وثبّتها أمام الكاميرا';
+        const String hint = 'غيّر المسافة بين العملة والكاميرا ببطء';
         emit(
           state.copyWith(
             phase: CurrencyDetectionPhase.lowLight,
@@ -360,66 +389,29 @@ class DetectionCubit extends Cubit<DetectionState> {
         if (!_detectingRecently()) {
           _maybeSpeakHint(hint);
         }
-      }
-      return;
+        return;
     }
+  }
 
-    if (entity.confidence <= _currencyThreshold || !hasMargin) {
-      // Currency suspected but not confident. Could be: low light, bad
-      // angle, hand shaking, or the bill is partially out of frame. Torch
-      // on to help; speak the hint only if we are not already mid-detection
-      // (a confident frame was just voted) — otherwise it just confuses.
-      unawaited(_setTorch(true));
-      const String hint = 'ثبّت يدك واقترب من العملة';
-      emit(
-        state.copyWith(
-          phase: CurrencyDetectionPhase.lowLight,
-          statusText: hint,
-          debugText: debugText,
-        ),
-      );
-      if (!_detectingRecently()) {
-        _maybeSpeakHint(hint);
-      }
-      return;
-    }
-
+  /// Announces a confirmed denomination. Speaks the GROUPED winner (e.g. y100),
+  /// not a single frame's sub-variant, so the spoken phrase always matches the
+  /// voted result; if the grouped key is somehow unmapped it says "unknown"
+  /// rather than reading a raw English token (e.g. "y100") aloud to a blind user.
+  void _announceCurrency(String groupKey, String debugText, DateTime now) {
+    final String mapped = arabicTtsForYemeniBill(groupKey);
+    final String spoken = mapped == groupKey ? 'العملة غير معروفة' : mapped;
+    _voter.clear();
+    _cooldownUntil = now.add(_speechCooldown);
+    _stopPulsingVibration();
     unawaited(_setTorch(false));
-    _pushVote(voteKey);
-
-    final String? winner = _majorityWinner();
-    if (winner != null && winner == voteKey) {
-      final String spoken = entity.displayName;
-      _voteWindow.clear();
-      _cooldownUntil = DateTime.now().add(_speechCooldown);
-      _stopPulsingVibration();
-      unawaited(_setTorch(false));
-      emit(
-        state.copyWith(
-          phase: CurrencyDetectionPhase.success,
-          statusText: spoken,
-          debugText: debugText,
-        ),
-      );
-      unawaited(_finishSuccessAnnouncement(spoken));
-      return;
-    }
-
     emit(
       state.copyWith(
-        phase: CurrencyDetectionPhase.scanning,
-        statusText: 'جاري المسح',
+        phase: CurrencyDetectionPhase.success,
+        statusText: spoken,
         debugText: debugText,
       ),
     );
-  }
-
-  void _pushVote(String label) {
-    _lastVoteAt = DateTime.now();
-    _voteWindow.add(label);
-    if (_voteWindow.length > _voteWindowSize) {
-      _voteWindow.removeAt(0);
-    }
+    unawaited(_finishSuccessAnnouncement(spoken));
   }
 
   /// True if a confident frame was voted within the last few seconds — the
@@ -428,36 +420,22 @@ class DetectionCubit extends Cubit<DetectionState> {
       _lastVoteAt != null &&
       DateTime.now().difference(_lastVoteAt!) < const Duration(seconds: 3);
 
-  /// Returns the label that appears at least [_requiredMatches] times in the
-  /// current voting window, or null if no label reaches the threshold.
-  String? _majorityWinner() {
-    if (_voteWindow.length < _requiredMatches) {
-      return null;
-    }
-    final Map<String, int> counts = <String, int>{};
-    for (final String label in _voteWindow) {
-      counts[label] = (counts[label] ?? 0) + 1;
-    }
-    String? best;
-    int bestCount = 0;
-    counts.forEach((String label, int count) {
-      if (count > bestCount) {
-        bestCount = count;
-        best = label;
-      }
-    });
-    if (bestCount >= _requiredMatches) {
-      return best;
-    }
-    return null;
-  }
-
   Future<void> _finishSuccessAnnouncement(String text) async {
+    final int runId = _runId;
     await _ttsService.speak(text);
+    // If the scan was stopped or restarted while we awaited the announcement,
+    // this call belongs to a finished session — leave the current session's
+    // cooldown timer and state untouched.
+    if (isClosed || runId != _runId) {
+      return;
+    }
     _cooldownTimer?.cancel();
     _cooldownTimer = Timer(_speechCooldown, () {
+      if (isClosed || runId != _runId) {
+        return;
+      }
       _cooldownUntil = null;
-      if (isClosed || !state.isActive) {
+      if (!state.isActive) {
         return;
       }
       _startPulsingVibration();
@@ -490,16 +468,30 @@ class DetectionCubit extends Cubit<DetectionState> {
     // Stale votes from before the background pause are no longer
     // meaningful — what the user was scanning might be totally different
     // now. Reset so we don't false-trigger on resume.
-    _voteWindow.clear();
-    await _repository.resumeCamera();
+    _voter.clear();
+    final bool resumed = await _repository.resumeCamera();
+    if (!resumed) {
+      // The capture session did not come back (common on iOS after a long
+      // background, or if camera permission was revoked while away). Don't
+      // leave a frozen "scanning" screen with no live frames — tear down and
+      // tell the user out loud to tap to restart.
+      await stop(announce: false);
+      unawaited(
+        _ttsService.speak(
+          'تعذّر استئناف الكاميرا. اضغط على الشاشة لإعادة التشغيل.',
+        ),
+      );
+      return;
+    }
     _startPulsingVibration();
     unawaited(WakelockPlus.enable());
   }
 
-  Future<void> stop() async {
+  Future<void> stop({bool announce = true}) async {
     if (!state.isActive) {
       return;
     }
+    _runId++;
     _stopPulsingVibration();
     unawaited(WakelockPlus.disable());
     _cooldownTimer?.cancel();
@@ -507,7 +499,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     _cooldownUntil = null;
     await _currencySubscription?.cancel();
     _currencySubscription = null;
-    _voteWindow.clear();
+    _voter.clear();
     await _setTorch(false);
 
     // Drop [CameraPreview] before disposing so buildPreview() never runs on a dead controller.
@@ -522,9 +514,20 @@ class DetectionCubit extends Cubit<DetectionState> {
     await Future<void>.delayed(Duration.zero);
 
     await _repository.stopCamera();
-    // Tell the blind user out loud that scanning has stopped — speak()
-    // first cuts any announcement that was still playing.
-    await _ttsService.speak('تم إيقاف التعرف. اضغط على الشاشة لإعادة التشغيل.');
+    if (announce) {
+      // Tell the blind user out loud that scanning has stopped — speak() first
+      // cuts any announcement that was still playing. Fire-and-forget on
+      // purpose: awaiting it would hold toggle()'s [_transitioning] guard for
+      // the full ~4s the sentence takes to speak (TTS uses
+      // awaitSpeakCompletion), so a quick second tap to restart would be
+      // swallowed until the sentence finished. Not awaiting lets the next tap
+      // start() immediately — start()'s own speak() cuts this sentence off.
+      // Callers that will speak their own message (e.g. resume-failure) pass
+      // announce:false to avoid two overlapping utterances.
+      unawaited(
+        _ttsService.speak('تم إيقاف التعرف. اضغط على الشاشة لإعادة التشغيل.'),
+      );
+    }
   }
 
   Future<void> toggle() async {

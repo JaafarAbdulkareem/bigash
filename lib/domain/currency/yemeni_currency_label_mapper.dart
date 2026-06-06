@@ -52,7 +52,10 @@ String arabicTtsForYemeniBill(String normalized) {
     case 'y200':
     case 'y200_new':
     case 'y200_old':
-      return 'مائتان ريال يمني';
+      // "مائتا" (not "مائتان"): in iḍāfa before the counted noun the nūn of
+      // the dual drops — "مِائَتَا رِيَالٍ". (y250 keeps "مائتان" because it is
+      // followed by the conjunction "و", not by the counted noun directly.)
+      return 'مائتا ريال يمني';
     case 'y250':
       return 'مائتان وخمسون ريال يمني';
     case 'y500':

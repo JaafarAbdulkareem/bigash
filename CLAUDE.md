@@ -63,7 +63,9 @@ app-lifecycle pause/resume that keeps the camera handle alive in the background.
 
 UI is just two pages: `SplashPage` (TTS welcome + camera-permission flow) and
 `ScannerPage` (full-screen gesture surface: tap = start/stop, long-press =
-screenshot to gallery, double-tap = cycle the model normalization mode).
+screenshot to gallery). There is intentionally **no** runtime gesture to change
+the normalization mode — cycling it away from `raw` would break the baked
+`Rescaling` contract and mis-classify every bill.
 
 ## Model contract — easy to break, hard to notice
 
@@ -86,8 +88,12 @@ The model and the Dart preprocessing must agree exactly, or the app
   the reported validation accuracy fictitious.
 - **`labels.txt` order must match the model's output class index order** — the
   order printed as "Class order" by `train_bigash_model.py`. Line N of
-  `assets/labels.txt` is class index N. Current classes: `other, y100, y1000,
-  y200, y250, y50, y500`.
+  `assets/labels.txt` is class index N. Current classes (9, after the y100/y200
+  new/old split): `other, y1000, y100_new, y100_old, y200_new, y200_old, y250,
+  y50, y500`. `TFLiteService.initialize()` now asserts the model's output class
+  count equals the labels line count and refuses to run (speaking an Arabic
+  error) on a mismatch — so a labels/model desync fails loud instead of
+  silently mis-mapping denominations.
 - The model filename is referenced in **two** places — `pubspec.yaml` `assets:`
   and `TFLiteService.modelAssetPath`. Renaming the model means updating both.
 - `labels.txt` entries are tolerated as `"<index> <label>"` or just `"<label>"`;

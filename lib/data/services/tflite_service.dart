@@ -61,12 +61,26 @@ class TFLiteService {
   int _outputZeroPoint = 0;
   int _numClasses = 0;
 
+  /// Non-null when the model/labels CONTRACT is violated (model loaded but its
+  /// output class count disagrees with assets/labels.txt, or labels failed to
+  /// load). A spoken-ready Arabic message — surfaced to the blind user instead
+  /// of silently mis-announcing every bill.
+  String? _contractError;
+
   final StreamController<TFLiteResult> _streamController =
       StreamController<TFLiteResult>.broadcast();
 
   Stream<TFLiteResult> get resultStream => _streamController.stream;
 
   bool get isModelLoaded => _interpreter != null;
+
+  String? get contractError => _contractError;
+
+  /// True only when the model is loaded, labels loaded, and the model's class
+  /// count matches the label count. The decision path must never run unless
+  /// this holds — a label/class mismatch would silently mis-map denominations.
+  bool get isModelReady =>
+      _interpreter != null && _labels.isNotEmpty && _contractError == null;
 
   Future<void> initialize() async {
     if (_interpreter == null) {
@@ -90,6 +104,33 @@ class TFLiteService {
     } catch (e) {
       debugPrint('Labels load failed: $e');
       _labels = <String>[];
+    }
+
+    _validateContract();
+  }
+
+  /// Verifies the bundled model and labels agree. A mismatch (e.g. a retrain
+  /// changed the class count but labels.txt wasn't updated, or vice-versa)
+  /// would otherwise be hidden by the `min(probs, labels)` clamp in
+  /// [processImage] and silently mis-announce denominations — the catastrophic
+  /// failure for this app. We fail LOUD: [isModelReady] goes false and
+  /// [contractError] carries a spoken Arabic explanation.
+  void _validateContract() {
+    _contractError = null;
+    if (_interpreter == null) {
+      return; // "no model" is handled separately (generic message).
+    }
+    if (_labels.isEmpty) {
+      _contractError =
+          'تعذّر تحميل ملف التسميات. أعد بناء التطبيق مع ملف labels المطابق للنموذج.';
+      return;
+    }
+    if (_numClasses > 0 && _numClasses != _labels.length) {
+      _contractError =
+          'النموذج وملف التسميات غير متطابقين. أعد بناء التطبيق بنموذج وتسميات من نفس التدريب.';
+      debugPrint(
+        '[TFLite] CONTRACT MISMATCH: model classes=$_numClasses, labels=${_labels.length}',
+      );
     }
   }
 
@@ -135,7 +176,9 @@ class TFLiteService {
     int sensorOrientation = 90,
     bool mirror = false,
   }) async {
-    if (_isProcessing || _interpreter == null || _labels.isEmpty) {
+    // Never run the decision path on a missing model, missing labels, or a
+    // model/labels contract mismatch — any of those could mis-map denominations.
+    if (_isProcessing || !isModelReady) {
       return;
     }
 
@@ -179,10 +222,14 @@ class TFLiteService {
         height: _inputHeight,
       );
 
-      // 4) Build TTA variants. Rotations (not flips) — the v18 model was
-      // trained with 90°/180°/270° augmentation, so all 4 orientations are
-      // valid inputs. Horizontal flip was NOT in training augmentation, so
-      // we don't use it.
+      // 4) Build TTA variants. Rotations (not flips). The v18 training applied
+      // orthogonal 90°/180°/270° rotation to only ~30% of TRAIN images and kept
+      // VAL upright, so the upright view is the best-calibrated input and the
+      // rotations are a robustness aid — averaging them lifts the soft model's
+      // confidence enough that good frames clear the voting threshold. Flip was
+      // NOT in training augmentation, so we don't use it. (If field data shows
+      // TTA lowers the clear-rate for upright bills, drop 180/270 or weight the
+      // upright variant higher.)
       final List<img.Image> variants = useTTA
           ? <img.Image>[
               resized,
@@ -406,10 +453,19 @@ class TFLiteService {
       return _convertYUV420(image);
     }
     if (Platform.isIOS && image.format.group == ImageFormatGroup.bgra8888) {
+      // iOS CVPixelBuffer rows are frequently padded so bytesPerRow > width*4
+      // (alignment), and the plane view may start at a non-zero offset. Passing
+      // rowStride + bytesOffset is REQUIRED — without them image.fromBytes
+      // assumes tightly-packed rows and reads every row after the first from
+      // the wrong offset, shearing the frame diagonally before crop/resize and
+      // silently corrupting the prediction.
+      final Plane plane = image.planes[0];
       return img.Image.fromBytes(
         width: image.width,
         height: image.height,
-        bytes: image.planes[0].bytes.buffer,
+        bytes: plane.bytes.buffer,
+        bytesOffset: plane.bytes.offsetInBytes,
+        rowStride: plane.bytesPerRow,
         order: img.ChannelOrder.bgra,
       );
     }

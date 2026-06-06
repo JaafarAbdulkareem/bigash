@@ -23,6 +23,12 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
   bool get isModelLoaded => tfliteService.isModelLoaded;
 
   @override
+  bool get isModelReady => tfliteService.isModelReady;
+
+  @override
+  String? get modelErrorMessage => tfliteService.contractError;
+
+  @override
   bool get isCameraReady => cameraService.isInitialized;
 
   @override
@@ -61,12 +67,10 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
   }
 
   @override
-  Future<void> resumeCamera() async {
-    await cameraService.resumeStreaming();
-  }
+  Future<bool> resumeCamera() => cameraService.resumeStreaming();
 
   @override
-  Future<void> setTorchEnabled(bool enabled) =>
+  Future<bool> setTorchEnabled(bool enabled) =>
       cameraService.setTorchEnabled(enabled);
 
   @override

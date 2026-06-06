@@ -141,17 +141,22 @@ class CameraService {
     }
   }
 
-  Future<void> setTorchEnabled(bool enabled) async {
+  /// Returns true if the flash mode was actually changed, false if there is no
+  /// usable controller or the device rejected the request — so the caller can
+  /// keep its cached torch state in sync with the hardware.
+  Future<bool> setTorchEnabled(bool enabled) async {
     final CameraController? controller = _cameraController;
     if (controller == null || !controller.value.isInitialized) {
-      return;
+      return false;
     }
     try {
       await controller.setFlashMode(
         enabled ? FlashMode.torch : FlashMode.off,
       );
+      return true;
     } catch (_) {
       // Torch may be unavailable on some devices.
+      return false;
     }
   }
 
@@ -171,13 +176,17 @@ class CameraService {
     }
   }
 
-  Future<void> resumeStreaming() async {
+  /// Returns true only if the camera is actually streaming frames again after
+  /// the call. On backgrounding (especially iOS) the capture session can be
+  /// torn down/invalidated; returning the real streaming state lets the caller
+  /// avoid leaving a frozen "scanning" screen with no live frames.
+  Future<bool> resumeStreaming() async {
     final CameraController? controller = _cameraController;
     if (controller == null || !controller.value.isInitialized) {
-      return;
+      return false;
     }
     if (controller.value.isStreamingImages) {
-      return;
+      return true;
     }
     final int orientation = sensorOrientation;
     final bool front = isFrontFacing;
@@ -193,8 +202,10 @@ class CameraService {
           );
         }
       });
+      return controller.value.isStreamingImages;
     } catch (e) {
       debugPrint('[Camera] resumeStreaming failed: $e');
+      return false;
     }
   }
 
