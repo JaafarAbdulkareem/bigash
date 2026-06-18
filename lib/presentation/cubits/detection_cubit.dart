@@ -251,6 +251,28 @@ class DetectionCubit extends Cubit<DetectionState> {
     unawaited(Vibration.cancel());
   }
 
+  /// A distinct confirmation buzz fired on EVERY announcement, independent of
+  /// TTS. The spoken denomination is the safety-critical output, but on a device
+  /// whose Arabic voice is missing or fails silently, `speak()` returns with no
+  /// audio and without throwing — so a blind user would otherwise get no
+  /// confirmation that a result fired. This haptic guarantees a non-audio cue.
+  /// The two patterns differ on purpose: a recognized bill is two firm pulses,
+  /// an unrecognized one is a single long pulse, so the user can tell them apart
+  /// even when they cannot hear the spoken phrase.
+  void _confirmVibrate({required bool recognized}) {
+    if (!_canVibrate) {
+      return;
+    }
+    unawaited(Vibration.cancel());
+    unawaited(
+      Vibration.vibrate(
+        pattern: recognized
+            ? const <int>[0, 200, 120, 200]
+            : const <int>[0, 500],
+      ),
+    );
+  }
+
   Future<void> _setTorch(bool on) async {
     if (_torchOn == on) {
       return;
@@ -292,6 +314,7 @@ class DetectionCubit extends Cubit<DetectionState> {
       return '${entity.label} ${(entity.confidence * 100).toStringAsFixed(0)}%';
     }
     return entity.topK
+        .take(3)
         .map((e) => '${e.key} ${(e.value * 100).toStringAsFixed(0)}%')
         .join('  |  ');
   }
@@ -349,6 +372,7 @@ class DetectionCubit extends Cubit<DetectionState> {
             _lastOtherAnnounceAt = now;
             _cooldownUntil = now.add(_speechCooldown);
             _stopPulsingVibration();
+            _confirmVibrate(recognized: false);
             emit(
               state.copyWith(
                 phase: CurrencyDetectionPhase.success,
@@ -399,10 +423,12 @@ class DetectionCubit extends Cubit<DetectionState> {
   /// rather than reading a raw English token (e.g. "y100") aloud to a blind user.
   void _announceCurrency(String groupKey, String debugText, DateTime now) {
     final String mapped = arabicTtsForYemeniBill(groupKey);
-    final String spoken = mapped == groupKey ? 'العملة غير معروفة' : mapped;
+    final bool recognized = mapped != groupKey;
+    final String spoken = recognized ? mapped : 'العملة غير معروفة';
     _voter.clear();
     _cooldownUntil = now.add(_speechCooldown);
     _stopPulsingVibration();
+    _confirmVibrate(recognized: recognized);
     unawaited(_setTorch(false));
     emit(
       state.copyWith(
@@ -455,9 +481,25 @@ class DetectionCubit extends Cubit<DetectionState> {
     if (!state.isActive) {
       return;
     }
+    // Invalidate any in-flight success-announcement continuation and its
+    // cooldown timer so they cannot fire while we are backgrounded — otherwise
+    // a cooldown that was armed just before backgrounding buzzes the phone in
+    // the user's pocket and emits a stale "scanning" state for a paused camera.
+    // Bumping _runId makes the awaited-TTS continuation in
+    // _finishSuccessAnnouncement bail instead of re-arming a fresh timer after
+    // _ttsService.stop() unblocks it. Clearing _cooldownUntil also stops a
+    // resume that lands mid-cooldown from silently dropping frames.
+    _runId++;
+    _cooldownTimer?.cancel();
+    _cooldownTimer = null;
+    _cooldownUntil = null;
     _stopPulsingVibration();
     unawaited(WakelockPlus.disable());
     await _repository.pauseCamera();
+    // pauseCamera drives the hardware torch off directly (bypassing _setTorch),
+    // so resync the cache — otherwise the low-light assist believes the torch is
+    // still on after resume and the early-return in _setTorch never re-enables it.
+    _torchOn = false;
     await _ttsService.stop();
   }
 

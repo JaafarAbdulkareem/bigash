@@ -239,9 +239,17 @@ def copy_and_filter(tmp_dir, target_dir, min_aspect=1.15, max_aspect=4.0,
 
 
 def remove_visual_duplicates(target_dir, threshold=6):
-    """Use perceptual hashing to remove near-duplicate images."""
+    """Use perceptual hashing to remove near-duplicate images.
+
+    IMPORTANT: only ever deletes files this scraper added (prefix
+    'scraped_'). Hand-added photos the user curated (e.g. the green 5-rupee
+    shots) are NEVER deleted, even if near-duplicates of each other — losing
+    curated confuser data would re-open the very false-positive we are fixing.
+    A scraped image that duplicates a hand-added one is removed (keeps the
+    user's copy)."""
     import imagehash
 
+    scraped_prefix = "scraped_"
     files = [
         f for f in os.listdir(target_dir)
         if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
@@ -262,11 +270,17 @@ def remove_visual_duplicates(target_dir, threshold=6):
             if f2 in to_delete:
                 continue
             if abs(h1 - h2) < threshold:
-                to_delete.add(f2)
+                if f2.startswith(scraped_prefix):
+                    to_delete.add(f2)
+                elif f1.startswith(scraped_prefix):
+                    to_delete.add(f1)
+                    break  # f1 is gone — stop comparing it
+                # else: both are hand-added — keep BOTH, never delete user data.
 
     for f in to_delete:
         os.remove(target_dir / f)
-    print(f"🗑️ Removed {len(to_delete)} visual duplicates")
+    print(f"🗑️ Removed {len(to_delete)} scraped visual duplicates "
+          f"(hand-added files preserved)")
 
 
 # ──────────────────────────────────────────────────────────────────────

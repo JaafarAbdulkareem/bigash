@@ -64,8 +64,11 @@ class FrameAssessment {
 /// Tunable gates for [classifyFrame]. Defaults mirror the field-tuned values.
 class DecisionThresholds {
   /// Minimum grouped probability for a currency denomination to be eligible.
-  /// The model is soft (label smoothing + MixUp), so a correct class often
-  /// sits ~0.35-0.55; this is a noise floor, not the real signal.
+  /// Calibrated to the retrained model (lighter MixUp + label smoothing): real
+  /// bills now land at ~0.88-0.95 grouped confidence, while borderline OOD
+  /// frames sit near the old 0.35 floor — so 0.50 rejects those without
+  /// touching genuine bills. Raise toward 0.6 only if field false positives
+  /// persist; lower if real bills get rejected (measure with tools/eval_model.py).
   final double currencyThreshold;
 
   /// Minimum grouped mass for the `other`/unknown verdict.
@@ -75,20 +78,28 @@ class DecisionThresholds {
   /// this margin (computed on grouped mass, never on raw sub-variants).
   final double voteMargin;
 
-  /// OUT-OF-DISTRIBUTION gate: the top currency denomination must also beat
-  /// the `other` mass by this margin. A genuine Yemeni bill drives `other`
-  /// near zero (so this passes trivially); a foreign/unseen note tends to
-  /// light up `other`, so when `other` competes with the top Yemeni class we
-  /// REFUSE to announce a denomination and prefer "unknown"/keep-scanning.
-  /// This is the gate that stops e.g. a foreign banknote from being read as
-  /// real Yemeni money.
+  /// OUT-OF-DISTRIBUTION gate (margin form): the top currency denomination
+  /// must beat the `other` mass by this margin. Catches foreign notes that
+  /// make `other` COMPETE with the top Yemeni class.
   final double oodMargin;
 
+  /// OUT-OF-DISTRIBUTION gate (ceiling form): refuse to announce a denomination
+  /// while `other` carries more than this much mass, EVEN IF a currency class
+  /// is confidently leading. A genuine Yemeni bill drives `other` to near zero;
+  /// a meaningful `other` signal (e.g. ~0.13 observed on an Indian 5-rupee that
+  /// the model confidently — and wrongly — called y200 at 0.60) means the model
+  /// sees non-Yemeni features and must not commit. Biases toward "unknown" over
+  /// a wrong announcement, per the project's safety-first stance. Field-tunable:
+  /// raise it if real worn bills get rejected too often. NOTE: this only REDUCES
+  /// such errors; the definitive fix is retraining with the confuser in `other`.
+  final double otherCeiling;
+
   const DecisionThresholds({
-    this.currencyThreshold = 0.35,
+    this.currencyThreshold = 0.50,
     this.otherThreshold = 0.28,
     this.voteMargin = 0.10,
     this.oodMargin = 0.15,
+    this.otherCeiling = 0.12,
   });
 }
 
@@ -127,8 +138,9 @@ FrameAssessment classifyFrame(
   final bool beatsOtherDenomination =
       (topCurrency - secondCurrency) >= t.voteMargin;
   final bool beatsOther = (topCurrency - otherProb) >= t.oodMargin;
+  final bool otherLowEnough = otherProb <= t.otherCeiling;
 
-  if (confident && beatsOtherDenomination && beatsOther) {
+  if (confident && beatsOtherDenomination && beatsOther && otherLowEnough) {
     return FrameAssessment(FrameVerdict.currency, currency[0].key, topCurrency);
   }
 

@@ -73,6 +73,68 @@ void main() {
       expect(a.verdict, isNot(FrameVerdict.currency));
     });
 
+    test('OOD CEILING: a confidently-WRONG denomination with a small-but-real '
+        '"other" signal is refused (the Indian 5-rupee field case: y200_old 60% '
+        '/ other 13%)', () {
+      final FrameAssessment a = classifyFrame(
+        e(<String, double>{'y200': 0.60, 'other': 0.13, 'y1000': 0.08}),
+        t,
+      );
+      expect(a.verdict, isNot(FrameVerdict.currency));
+    });
+
+    test('REGRESSION (OOD via full distribution): a foreign note whose "other" '
+        'mass sits at rank 4+ is still refused — the gate must see the FULL '
+        'distribution, not a top-3 that drops "other"', () {
+      // Realistic foreign-note softmax: two y200 sub-variants + y500 fill the
+      // top-3, pushing the real "other" mass (0.14) to rank 4. If TFLiteService
+      // truncated to the top-3 (the fixed bug), otherProb would arrive as 0 and
+      // this would be announced as a confident "مائتا ريال". With the full
+      // distribution carried through, otherProb=0.14 > otherCeiling(0.12) and
+      // the note is correctly refused.
+      final FrameAssessment a = classifyFrame(
+        groupTopK(e(<String, double>{
+          'y200_old': 0.32,
+          'y200_new': 0.28,
+          'y500': 0.15,
+          'other': 0.14, // rank 4 — dropped by any top-3 truncation
+          'y1000': 0.05,
+          'y250': 0.03,
+          'y50': 0.02,
+          'y100_new': 0.005,
+          'y100_old': 0.005,
+        })),
+        t,
+      );
+      expect(a.verdict, isNot(FrameVerdict.currency));
+    });
+
+    test('REGRESSION (grouping via full distribution): a worn y100 whose two '
+        'designs are split by higher-scoring distractors still sums to a '
+        'confident y100 — both sub-variants must be summed even when one ranks '
+        '4th+', () {
+      // y100_new (0.40) leads, but y500/y250 outrank the weak y100_old echo
+      // (0.14), so y100_old is rank 4. Top-3 truncation would group y100 at only
+      // 0.40 and reject a real bill as "uncertain". The full distribution sums
+      // y100 to 0.54 and announces it.
+      final FrameAssessment a = classifyFrame(
+        groupTopK(e(<String, double>{
+          'y100_new': 0.40,
+          'y500': 0.16,
+          'y250': 0.15,
+          'y100_old': 0.14, // rank 4 — dropped by any top-3 truncation
+          'other': 0.11,
+          'y1000': 0.02,
+          'y50': 0.01,
+          'y200_new': 0.005,
+          'y200_old': 0.005,
+        })),
+        t,
+      );
+      expect(a.verdict, FrameVerdict.currency);
+      expect(a.key, 'y100');
+    });
+
     test('decisively non-Yemeni: dominant "other" yields unknown', () {
       final FrameAssessment a = classifyFrame(
         e(<String, double>{'other': 0.62, 'y500': 0.20, 'y250': 0.10}),

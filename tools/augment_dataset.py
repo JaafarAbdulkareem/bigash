@@ -16,11 +16,19 @@ v5 — critical correctness fix vs v4:
     the model does on real photos, not how it survives our filters.
   - Use --val_split to control the held-out fraction (default 0.2).
 
-v4 augmentation set (unchanged — applied to TRAINING images only):
-  - 12 variants per image; rotation ±20° + 30% chance of 90°/180°/270°
-  - motion/gaussian blur, color temperature, gamma, grayscale (8%)
-  - JPEG quality 25-92, cutout 1-3 patches, perspective, lens distortion
-  - shadows and specular-highlight clusters
+augmentation set (applied to TRAINING images only):
+  - BALANCED variants/image (default): per class, sized to ~--target_per_class
+    train imgs so scarce classes (y100_new) are no longer under-represented.
+    Pass --variants N for the old fixed-N behaviour.
+  - rotation ±20° + 30% chance of 90°/180°/270° (matches the app's 4-rot TTA)
+  - motion/gaussian blur, color temperature, gamma
+  - COLOUR-RELIANCE BREAKERS: hue rotation ±63° (45%) + grayscale (30%) — force
+    the model to classify by shape/text, not colour, so a green foreign note is
+    not read as the green old-200 (confirmed field false-positive)
+  - AT MOST ONE sharpness-destroyer per variant (blur OR lowres), JPEG q50-95,
+    cutout capped at ~12% area — so no variant becomes unreadable-but-labeled
+    (which would only reward colour-guessing). The clean original is always kept.
+  - perspective, lens distortion, shadows and specular-highlight clusters
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ import argparse
 import math
 import random
 import shutil
+import zlib
 from pathlib import Path
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageDraw, ImageOps
@@ -83,6 +92,21 @@ def _random_grayscale(img, rng):
     return Image.merge("RGB", (gs, gs, gs))
 
 
+def _random_hue(img, rng):
+    """Rotate hue so the model cannot lean on ABSOLUTE colour to tell
+    denominations apart. This is the key defence when a foreign note shares a
+    Yemeni note's colour — e.g. the green Indian 5-rupee vs the green old 200,
+    a confirmed field false-positive. The label is unchanged, so a hue-shifted
+    bill must still be classified by its shape/text/layout, not 'green => 200'.
+    PIL's H channel is 0-255; ±45 ≈ ±63°, wide enough to defeat the specific
+    green-5-rupee vs green-old-200 confuser while keeping the bill recognisable
+    by shape/text. The label is unchanged, so colour can no longer be a shortcut."""
+    hsv = np.asarray(img.convert("HSV"), dtype=np.int16)
+    shift = int(rng.uniform(-45, 45))
+    hsv[..., 0] = (hsv[..., 0] + shift) % 256
+    return Image.fromarray(hsv.astype(np.uint8), mode="HSV").convert("RGB")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Geometric augmentations
 # ──────────────────────────────────────────────────────────────────────
@@ -99,7 +123,11 @@ def _random_orthogonal_rotate(img, rng):
 
 
 def _random_zoom(img, rng):
-    zoom = rng.uniform(0.75, 1.25)
+    # Tightened from 0.75-1.25: a strong zoom-OUT plus translate could push the
+    # bill out of frame and, after the trainer's center-crop, leave a partial/
+    # empty bill still labeled with its denomination — an unreadable-but-labeled
+    # sample that only colour-guessing can "solve".
+    zoom = rng.uniform(0.85, 1.20)
     w, h = img.size
     new_w, new_h = max(1, int(w * zoom)), max(1, int(h * zoom))
     resized = img.resize((new_w, new_h), Image.BILINEAR)
@@ -155,8 +183,10 @@ def _perspective_coeffs(src, dst):
 
 def _random_translate(img, rng):
     w, h = img.size
-    tx = rng.randint(int(-w * 0.12), int(w * 0.12))
-    ty = rng.randint(int(-h * 0.12), int(h * 0.12))
+    # Tightened from 0.12 → 0.08 so the bill stays within frame before the
+    # trainer's center-crop (see _random_zoom note).
+    tx = rng.randint(int(-w * 0.08), int(w * 0.08))
+    ty = rng.randint(int(-h * 0.08), int(h * 0.08))
     return img.transform(
         (w, h), Image.AFFINE, (1, 0, tx, 0, 1, ty),
         resample=Image.BILINEAR, fillcolor=(0, 0, 0),
@@ -219,10 +249,12 @@ def _random_noise(img, rng):
 
 def _random_jpeg_quality(img, rng):
     """Re-encode at random JPEG quality for compression artifacts.
-    Range 25-92 includes nasty WhatsApp-level compression."""
+    Range 50-95: lifted the floor from 25 so compression no longer dissolves
+    the denomination numerals (heavy JPEG used to stack with blur/lowres into an
+    unreadable bill)."""
     import io
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=rng.randint(25, 92))
+    img.save(buf, "JPEG", quality=rng.randint(50, 95))
     buf.seek(0)
     return Image.open(buf).convert("RGB")
 
@@ -230,7 +262,10 @@ def _random_jpeg_quality(img, rng):
 def _random_lowres(img, rng):
     """Down-sample then up-sample — simulates low-res or far-distance."""
     w, h = img.size
-    factor = rng.uniform(1.8, 5.0)
+    # Capped 5.0 → 3.0: a 5x downsample of an already-384px image leaves the
+    # denomination numerals unreadable, teaching colour-guessing. 3x still
+    # simulates a far/low-res shot while keeping the value legible.
+    factor = rng.uniform(1.5, 3.0)
     small_w = max(1, int(w / factor))
     small_h = max(1, int(h / factor))
     return img.resize((small_w, small_h), Image.BILINEAR).resize(
@@ -247,9 +282,12 @@ def _random_erasing(img, rng):
     area = w * h
     out = img.copy()
     draw = ImageDraw.Draw(out)
-    num_cuts = rng.choice([1, 1, 2, 3])  # weighted: usually 1, sometimes 2-3
+    num_cuts = rng.choice([1, 1, 2])  # usually 1, sometimes 2
     for _ in range(num_cuts):
-        target = rng.uniform(0.02, 0.30) * area / num_cuts
+        # Total erased area capped at ~0.12 (was 0.30): a 30% opaque patch could
+        # blank the denomination numerals while keeping the label — an
+        # unreadable-but-labeled sample that rewards colour-guessing.
+        target = rng.uniform(0.02, 0.12) * area / num_cuts
         aspect = rng.uniform(0.3, 3.3)
         rh = min(h - 1, int(math.sqrt(target / aspect)))
         rw = min(w - 1, int(math.sqrt(target * aspect)))
@@ -322,6 +360,9 @@ def _preresize(img):
 
 def augment_once(img, seed):
     rng = random.Random(seed)
+    # Seed NumPy's global RNG too: _random_noise draws from np.random, which
+    # would otherwise be unseeded and make augmentation non-reproducible.
+    np.random.seed(seed % (2 ** 32))
 
     # Photometric
     img = _random_brightness(img, rng)
@@ -330,7 +371,11 @@ def augment_once(img, seed):
     img = _maybe(img, _random_color_temperature, rng, 0.5)
     img = _maybe(img, _random_gamma, rng, 0.45)
     img = _maybe(img, _random_sharpness, rng, 0.4)
-    img = _maybe(img, _random_grayscale, rng, 0.08)  # rare, but useful
+    # Colour-reliance breakers — raised deliberately: the model was over-fitting
+    # to colour (green Indian 5-rupee read as the green old 200). Hue rotation +
+    # frequent grayscale force it to learn denomination shape/text instead.
+    img = _maybe(img, _random_hue, rng, 0.45)
+    img = _maybe(img, _random_grayscale, rng, 0.30)  # was 0.08 — too colour-reliant
 
     # Geometric — orthogonal first (so subsequent rotations stack nicely)
     img = _maybe(img, _random_orthogonal_rotate, rng, 0.30)  # ← solves upside-down
@@ -341,29 +386,42 @@ def augment_once(img, seed):
     img = _maybe(img, _random_perspective, rng, 0.50)
     img = _maybe(img, _random_lens_distortion, rng, 0.25)  # new: lens curvature
 
-    # Camera-quality degradations
-    if rng.random() < 0.60:
-        if rng.random() < 0.5:
-            img = _random_motion_blur(img, rng)
-        else:
-            img = _random_gaussian_blur(img, rng)
+    # Camera-quality degradations — apply AT MOST ONE sharpness-destroyer so we
+    # never stack blur + lowres + heavy-JPEG into an unreadable-but-labeled
+    # image (the only way to "classify" which is colour-guessing — the exact
+    # green-5-rupee failure). The clean original is always saved separately as a
+    # readable anchor for every source bill.
+    d = rng.random()
+    if d < 0.30:
+        img = _random_motion_blur(img, rng)
+    elif d < 0.50:
+        img = _random_gaussian_blur(img, rng)
+    elif d < 0.65:
+        img = _random_lowres(img, rng)
+    # else (~35%): keep it sharp
 
-    img = _maybe(img, _random_noise, rng, 0.55)
+    img = _maybe(img, _random_noise, rng, 0.45)
     img = _maybe(img, _random_shadow, rng, 0.35)
     img = _maybe(img, _random_highlight, rng, 0.30)
-    img = _maybe(img, _random_erasing, rng, 0.35)
-    img = _maybe(img, _random_lowres, rng, 0.30)
-    img = _maybe(img, _random_jpeg_quality, rng, 0.55)
+    img = _maybe(img, _random_erasing, rng, 0.30)  # area capped inside the fn
+    img = _maybe(img, _random_jpeg_quality, rng, 0.45)  # min quality raised to 50
 
     return img
 
 
-def process_class(class_dir, train_out, val_out, variants, val_split, seed):
+def process_class(class_dir, train_out, val_out, val_split, seed,
+                  fixed_variants, target_per_class, min_variants, max_variants):
     """Split this class's SOURCE images into train/val, THEN augment.
 
     Splitting before augmentation is the whole point of v5: augmented
     variants of one photo must never land in both train and val, or the
-    reported val accuracy becomes meaningless."""
+    reported val accuracy becomes meaningless.
+
+    BALANCED MODE (default): variants-per-image are derived from the class's
+    train size to hit `target_per_class` total train images, so scarce classes
+    (e.g. y100_new=170) get MORE variants and every class ends up near-equal.
+    This replaces the old fixed-12-variants, which preserved the 3.2x source
+    imbalance verbatim. Pass `fixed_variants > 0` to force the old behaviour."""
     train_out.mkdir(parents=True, exist_ok=True)
     val_out.mkdir(parents=True, exist_ok=True)
 
@@ -385,9 +443,19 @@ def process_class(class_dir, train_out, val_out, variants, val_split, seed):
         n_val = 0
     val_imgs = shuffled[:n_val]
     train_imgs = shuffled[n_val:]
+    n_train = len(train_imgs)
+
+    # Per-class variant budget → balance the train set across classes.
+    if fixed_variants and fixed_variants > 0:
+        variants = fixed_variants
+    elif n_train > 0:
+        variants = max(min_variants,
+                       min(max_variants, round(target_per_class / n_train) - 1))
+    else:
+        variants = 0
 
     print(f"  [{class_dir.name}] {len(imgs)} originals -> "
-          f"train {len(train_imgs)} (+{len(train_imgs) * variants} aug)  |  "
+          f"train {n_train} x{variants + 1} = {n_train * (variants + 1)}  |  "
           f"val {len(val_imgs)} (raw)")
     if n_val == 0:
         print(f"    ⚠️ '{class_dir.name}' has too few images for a val split "
@@ -403,7 +471,10 @@ def process_class(class_dir, train_out, val_out, variants, val_split, seed):
             continue
         img.save(train_out / f"{idx:05d}_orig.jpg", "JPEG", quality=92)
         for v in range(variants):
-            seed_v = hash((src_path.name, v)) & 0xFFFFFFFF
+            # Stable, reproducible per-variant seed (Python's hash() is salted
+            # per process). Keyed on class+full-name+variant so two classes that
+            # share a filename don't get identical augmentation decisions.
+            seed_v = zlib.crc32(f"{class_dir.name}/{src_path.name}|{v}".encode())
             try:
                 aug = augment_once(img, seed=seed_v)
                 aug.save(train_out / f"{idx:05d}_aug{v}.jpg", "JPEG",
@@ -454,7 +525,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input_dir", type=Path)
     ap.add_argument("--output_dir", type=Path)
-    ap.add_argument("--variants", type=int, default=12)  # was 8
+    ap.add_argument("--variants", type=int, default=0,
+                    help="Fixed variants PER IMAGE. 0 (default) = BALANCED mode: "
+                         "variants are derived per class from --target_per_class "
+                         "so classes end up near-equal (fixes the imbalance).")
+    ap.add_argument("--target_per_class", type=int, default=3200,
+                    help="Balanced mode: approx augmented TRAIN images per class.")
+    ap.add_argument("--min_variants", type=int, default=4,
+                    help="Balanced mode: floor on variants/image for big classes.")
+    ap.add_argument("--max_variants", type=int, default=30,
+                    help="Balanced mode: cap on variants/image for tiny classes.")
     ap.add_argument("--val_split", type=float, default=0.2,
                     help="Fraction of SOURCE images per class held out for "
                          "validation (split before augmentation — leak-free).")
@@ -482,14 +562,19 @@ def main():
     val_root.mkdir(parents=True)
 
     class_dirs = sorted(p for p in args.input_dir.iterdir() if p.is_dir())
-    print(f"Found {len(class_dirs)} classes, {args.variants} variants each.")
+    mode = (f"FIXED {args.variants} variants/image" if args.variants > 0
+            else f"BALANCED to ~{args.target_per_class} train imgs/class")
+    print(f"Found {len(class_dirs)} classes. Augmentation: {mode}.")
     print(f"Val split: {args.val_split:.0%} of SOURCE images, held out "
           f"BEFORE augmentation (no leakage).")
     print(f"Pre-resize to {MAX_SIDE} px on long edge for speed.\n")
     for cd in class_dirs:
         process_class(cd, train_root / cd.name, val_root / cd.name,
-                      variants=args.variants, val_split=args.val_split,
-                      seed=args.seed)
+                      val_split=args.val_split, seed=args.seed,
+                      fixed_variants=args.variants,
+                      target_per_class=args.target_per_class,
+                      min_variants=args.min_variants,
+                      max_variants=args.max_variants)
     print(f"\nDone.\n  train -> {train_root}\n  val   -> {val_root}")
 
 

@@ -32,8 +32,10 @@ enum NormalizationMode { raw, signed, unsigned, imageNet }
 class TFLiteService {
   static const String modelAssetPath = 'assets/bigash_v18.tflite';
 
-  /// One inference per frame at ~250 ms — a steady detection cadence for
-  /// blind-user scanning.
+  /// Minimum spacing between *emitted* results — a steady detection cadence for
+  /// blind-user scanning. With [useTTA] on, each processed frame runs FOUR
+  /// inferences, so the real cadence is max(250 ms, 4× inference time); this is
+  /// only the floor that throttles emissions, not a promise of one pass/250 ms.
   static const Duration _minFrameInterval = Duration(milliseconds: 250);
 
   /// The bigash model has its own Rescaling layer baked in, so it expects
@@ -277,13 +279,23 @@ class TFLiteService {
       }
       final String label = _labels[bestIndex].trim();
 
+      // Carry the FULL class distribution (all classes), not just the top-3.
+      // The decision core's out-of-distribution gate sums the `other` mass and
+      // the new/old sub-variant mass from THIS list (frame_decision.dart). If we
+      // truncated to the top-3, a foreign note whose `other` probability ranks
+      // 4th+ — easy, because y100/y200 each occupy two classes that can fill the
+      // top slots — would reach classifyFrame with otherProb=0 and be announced
+      // as a confident Yemeni denomination, the exact safety failure the gate
+      // exists to prevent. (It also under-counted a worn bill whose two designs
+      // were split by a distractor.) Truncation is for display only — see
+      // DetectionCubit._buildDebugText.
       final List<MapEntry<String, double>> topK = <MapEntry<String, double>>[];
-      for (int i = 0; i < math.min(3, indices.length); i++) {
+      for (int i = 0; i < indices.length; i++) {
         topK.add(MapEntry(_labels[indices[i]].trim(), accumProbs[indices[i]]));
       }
       debugPrint(
-        '[TFLite] ${normalization.name} TTA=${useTTA ? "x${variants.length}" : "off"} top3='
-        '${topK.map((e) => "${e.key}=${e.value.toStringAsFixed(2)}").join(", ")}',
+        '[TFLite] ${normalization.name} TTA=${useTTA ? "x${variants.length}" : "off"} top='
+        '${topK.take(3).map((e) => "${e.key}=${e.value.toStringAsFixed(2)}").join(", ")}',
       );
 
       if (!_streamController.isClosed) {

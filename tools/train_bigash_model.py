@@ -163,12 +163,17 @@ def cutmix_batch(images, labels, alpha=1.0):
 def augment_pipeline(images, labels):
     """Randomly apply MixUp (40%) or CutMix (30%); otherwise pass through.
     Probabilities chosen empirically — MixUp slightly preferred."""
+    # Softened from 40%/30% to 20%/15%: on a small (~2.7k img) set, heavy
+    # MixUp+CutMix caps the correct-class target near 0.65-0.70 and pushes the
+    # real-bill softmax into the app's 0.35 noise-floor / 0.10-0.15 margin danger
+    # zone. Lighter mixing keeps generalisation while letting correct bills clear
+    # the app's confidence gates without relying on inference-time TTA to rescue.
     r = tf.random.uniform([])
     return tf.cond(
-        r < 0.40,
+        r < 0.20,
         lambda: mixup_batch(images, labels),
         lambda: tf.cond(
-            r < 0.70,
+            r < 0.35,
             lambda: cutmix_batch(images, labels),
             lambda: (images, labels),
         ),
@@ -192,13 +197,18 @@ def prepare_datasets(train_ds, val_ds):
 # Model construction
 # ──────────────────────────────────────────────────────────────────────
 
-def build_backbone(name, weights_path=None):
+def build_backbone(name, weights_path=None, allow_imagenet=True):
     """Returns (backbone_model, preprocess_layers).
 
     The preprocess_layers convert input in [0, 255] float32 to whatever
     range the backbone expects. They are baked into the exported graph
-    so the Flutter app can keep passing raw [0, 255]."""
+    so the Flutter app can keep passing raw [0, 255].
+
+    allow_imagenet=False builds with random weights and NO download — used by
+    the TFLite export, which immediately overwrites all weights via set_weights,
+    so it must never trigger an ImageNet fetch (which crashes offline/Kaggle)."""
     name = name.lower()
+    imagenet = "imagenet" if allow_imagenet else None
     if name == "mobilenetv2":
         if weights_path and os.path.exists(weights_path):
             print(f"📦 Loading MobileNetV2 weights from {weights_path}")
@@ -210,7 +220,7 @@ def build_backbone(name, weights_path=None):
         else:
             base = tf.keras.applications.MobileNetV2(
                 input_shape=(IMG_SIZE, IMG_SIZE, 3),
-                include_top=False, weights="imagenet",
+                include_top=False, weights=imagenet,
             )
         # MobileNetV2 expects [-1, 1].
         preprocess = layers.Rescaling(scale=1.0 / 127.5, offset=-1.0)
@@ -227,7 +237,7 @@ def build_backbone(name, weights_path=None):
         else:
             base = tf.keras.applications.EfficientNetB0(
                 input_shape=(IMG_SIZE, IMG_SIZE, 3),
-                include_top=False, weights="imagenet",
+                include_top=False, weights=imagenet,
             )
         # EfficientNet has Normalization baked in — pass raw [0, 255].
         # We still insert an Identity-ish Rescaling for export uniformity.
@@ -237,10 +247,10 @@ def build_backbone(name, weights_path=None):
     raise ValueError(f"Unknown backbone: {name}")
 
 
-def build_model(num_classes, backbone_name, weights_path=None):
-    """Clean architecture — no in-model augmentation; offline pipeline
-    (augment_dataset.py v4) already provides 12 variants per image."""
-    base, preprocess = build_backbone(backbone_name, weights_path)
+def build_model(num_classes, backbone_name, weights_path=None, allow_imagenet=True):
+    """Clean architecture — no in-model augmentation; the offline
+    augment_dataset.py pipeline already provides the augmented variants."""
+    base, preprocess = build_backbone(backbone_name, weights_path, allow_imagenet)
     base.trainable = False
 
     inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3), dtype=tf.float32)
@@ -261,15 +271,19 @@ def build_model(num_classes, backbone_name, weights_path=None):
 # ──────────────────────────────────────────────────────────────────────
 
 def make_callbacks(ckpt_path):
+    # Monitor val_LOSS (min), not val_accuracy. On an imbalanced set with a
+    # dominant 'other' class, top-1 accuracy rewards majority bias and is blind
+    # to the asymmetric cost (a false denomination >> a missed read). val_loss
+    # rewards calibrated probabilities — what the app's confidence gates need.
     # ReduceLROnPlateau is incompatible with CosineDecay — don't add it.
     return [
         callbacks.EarlyStopping(
             patience=12, restore_best_weights=True,
-            monitor="val_accuracy", mode="max",
+            monitor="val_loss", mode="min",
         ),
         callbacks.ModelCheckpoint(
             ckpt_path, save_best_only=True,
-            monitor="val_accuracy", mode="max",
+            monitor="val_loss", mode="min",
         ),
     ]
 
@@ -284,24 +298,6 @@ def cosine_schedule(initial_lr, total_steps, warmup_steps):
     )
 
 
-def compute_class_weights(train_dir, class_names):
-    """Inverse-frequency class weights, normalised to mean=1.0.
-    Counts come from the TRAINING split only. Boosts rare classes;
-    'other' gets an extra +20% to discourage false-positive currency
-    announcements."""
-    counts = []
-    for c in class_names:
-        d = pathlib.Path(train_dir) / c
-        counts.append(len([p for p in d.iterdir() if p.is_file()]))
-    counts = np.array(counts, dtype=np.float64)
-    weights = counts.mean() / counts
-    weights = weights / weights.mean()  # normalise so mean is 1.0
-    weight_dict = {i: float(w) for i, w in enumerate(weights)}
-    if "other" in class_names:
-        weight_dict[class_names.index("other")] *= 1.2
-    return weight_dict
-
-
 def train(data_dir, output_dir, head_epochs, finetune_epochs,
           finetune_at, mixed_precision, backbone_name, weights_path=None):
     if mixed_precision:
@@ -313,7 +309,7 @@ def train(data_dir, output_dir, head_epochs, finetune_epochs,
 
     train_ds_raw, val_ds, class_names = build_datasets(data_dir)
     num_classes = len(class_names)
-    steps_per_epoch = tf.data.experimental.cardinality(train_ds_raw).numpy()
+    steps_per_epoch = int(train_ds_raw.cardinality().numpy())
     if steps_per_epoch <= 0:
         steps_per_epoch = 100
 
@@ -324,16 +320,19 @@ def train(data_dir, output_dir, head_epochs, finetune_epochs,
     model, base = build_model(num_classes, backbone_name, weights_path)
     print(f"\n🧠 Backbone: {backbone_name}")
     print(f"📊 Steps per epoch: {steps_per_epoch}")
-
-    class_weight = compute_class_weights(pathlib.Path(data_dir) / "train", class_names)
-    print(f"⚖️ Class weights: { {class_names[i]: round(v, 2) for i, v in class_weight.items()} }")
+    # NOTE: imbalance is handled at the DATA level by augment_dataset.py's
+    # balanced mode (per-class variant budget). We deliberately do NOT pass
+    # class_weight here: Keras silently ignores/mis-applies class_weight with a
+    # tf.data.Dataset of one-hot labels that MixUp/CutMix turn into SOFT labels,
+    # so it was a no-op anyway — and stacking it on now-balanced data would
+    # over-correct toward minority denominations and raise false positives.
 
     # ── Stage 1: classification head only ────────────────────────────
     s1_steps = head_epochs * steps_per_epoch
     s1_warmup = max(1, int(0.08 * s1_steps))
     model.compile(
         optimizer=optimizers.Adam(cosine_schedule(1e-3, s1_steps, s1_warmup)),
-        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.08),
+        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.03),
         metrics=["accuracy"],
     )
     model.summary()
@@ -341,10 +340,9 @@ def train(data_dir, output_dir, head_epochs, finetune_epochs,
     stage1_ckpt = output_dir / "stage1_best.keras"
     print("\n=== Stage 1: train classification head ===")
     h1 = model.fit(train_ds, validation_data=val_ds, epochs=head_epochs,
-                   callbacks=make_callbacks(str(stage1_ckpt)),
-                   class_weight=class_weight)
-    best_s1 = max(h1.history.get("val_accuracy", [0.0]))
-    print(f"Stage 1 best val_accuracy: {best_s1:.4f}")
+                   callbacks=make_callbacks(str(stage1_ckpt)))
+    best_s1 = min(h1.history.get("val_loss", [float("inf")]))
+    print(f"Stage 1 best val_loss: {best_s1:.4f}")
 
     # ── Stage 2: fine-tune top of backbone (BN frozen) ───────────────
     print("\n=== Stage 2: fine-tune backbone (BN layers frozen) ===")
@@ -360,23 +358,22 @@ def train(data_dir, output_dir, head_epochs, finetune_epochs,
     # Slightly higher fine-tune LR than v2 (5e-6 was very timid).
     model.compile(
         optimizer=optimizers.Adam(cosine_schedule(1e-5, s2_steps, s2_warmup)),
-        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.08),
+        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.03),
         metrics=["accuracy"],
     )
     stage2_ckpt = output_dir / "stage2_best.keras"
     h2 = model.fit(train_ds, validation_data=val_ds, epochs=finetune_epochs,
-                   callbacks=make_callbacks(str(stage2_ckpt)),
-                   class_weight=class_weight)
-    best_s2 = max(h2.history.get("val_accuracy", [0.0]))
-    print(f"Stage 2 best val_accuracy: {best_s2:.4f}")
+                   callbacks=make_callbacks(str(stage2_ckpt)))
+    best_s2 = min(h2.history.get("val_loss", [float("inf")]))
+    print(f"Stage 2 best val_loss: {best_s2:.4f}")
 
-    # ── Pick the better stage ────────────────────────────────────────
-    if best_s1 >= best_s2:
-        print(f"\n✅ Using Stage 1 weights (val_acc={best_s1:.4f})")
+    # ── Pick the better stage (lower val_loss is better) ─────────────
+    if best_s1 <= best_s2:
+        print(f"\n✅ Using Stage 1 weights (val_loss={best_s1:.4f})")
         if stage1_ckpt.exists():
             model = tf.keras.models.load_model(stage1_ckpt)
     else:
-        print(f"\n✅ Using Stage 2 weights (val_acc={best_s2:.4f})")
+        print(f"\n✅ Using Stage 2 weights (val_loss={best_s2:.4f})")
         if stage2_ckpt.exists():
             model = tf.keras.models.load_model(stage2_ckpt)
 
@@ -424,16 +421,31 @@ def export_tflite(model, class_names, output_dir, quantize, backbone_name):
     # architecture under a pure float32 policy, copy the trained weights
     # in, and convert that clean float32 graph instead.
     tf.keras.mixed_precision.set_global_policy("float32")
-    fp32_model, _ = build_model(len(class_names), backbone_name)
+    # allow_imagenet=False: this rebuild's weights are immediately overwritten
+    # by set_weights, so it must NOT download ImageNet (which fails offline and
+    # used to silently abort the whole export).
+    fp32_model, _ = build_model(len(class_names), backbone_name, allow_imagenet=False)
     fp32_model.set_weights(model.get_weights())
 
-    converter = tf.lite.TFLiteConverter.from_keras_model(fp32_model)
+    def _convert(conv):
+        if quantize == "fp16":
+            conv.optimizations = [tf.lite.Optimize.DEFAULT]
+            conv.target_spec.supported_types = [tf.float16]
+        return conv.convert()
 
-    if quantize == "fp16":
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.target_spec.supported_types = [tf.float16]
+    try:
+        tflite_bytes = _convert(tf.lite.TFLiteConverter.from_keras_model(fp32_model))
+    except Exception as e:
+        # Keras 3 (TF 2.16+, incl. Colab's TF 2.20) can fail to convert an
+        # in-memory model directly; the supported route is via a SavedModel.
+        print(f"⚠️ from_keras_model failed ({e}); retrying via SavedModel ...")
+        sm_dir = str(output_dir / "_saved_model")
+        try:
+            fp32_model.export(sm_dir)             # Keras 3 SavedModel export
+        except AttributeError:
+            tf.saved_model.save(fp32_model, sm_dir)  # Keras 2 fallback
+        tflite_bytes = _convert(tf.lite.TFLiteConverter.from_saved_model(sm_dir))
 
-    tflite_bytes = converter.convert()
     tflite_path = output_dir / MODEL_FILENAME
     tflite_path.write_bytes(tflite_bytes)
     print(f"✅ Wrote {tflite_path} ({len(tflite_bytes) / 1024 / 1024:.2f} MB)")
@@ -453,6 +465,19 @@ def export_tflite(model, class_names, output_dir, quantize, backbone_name):
     print(f"\nTFLite IO: in={in_det['shape']} {in_det['dtype']} -> "
           f"out={out_det['shape']} {out_det['dtype']}")
 
+    # ── Hard contract asserts — fail LOUD if the export won't match the app ──
+    if in_det["dtype"] != np.float32:
+        raise AssertionError(
+            f"Input dtype is {in_det['dtype']}; the app feeds raw float32. "
+            f"Do not int8-quantize the input tensor.")
+    if list(in_det["shape"]) != [1, IMG_SIZE, IMG_SIZE, 3]:
+        raise AssertionError(
+            f"Input shape {list(in_det['shape'])} != [1,{IMG_SIZE},{IMG_SIZE},3].")
+    if int(out_det["shape"][-1]) != len(class_names):
+        raise AssertionError(
+            f"Model outputs {int(out_det['shape'][-1])} classes but there are "
+            f"{len(class_names)} labels — the app's count assert would refuse it.")
+
     zeros = np.zeros([1, IMG_SIZE, IMG_SIZE, 3], dtype=np.float32)
     interp.set_tensor(in_det["index"], zeros)
     interp.invoke()
@@ -460,6 +485,9 @@ def export_tflite(model, class_names, output_dir, quantize, backbone_name):
     print("Sanity check (zero image — expect 'other' highest):")
     for name, v in zip(class_names, out.astype(np.float32)):
         print(f"  {name:<8} {float(v):.3f}")
+    if "other" in class_names and class_names[int(np.argmax(out))] != "other":
+        print(f"  ⚠️ zero image classified as '{class_names[int(np.argmax(out))]}', "
+              f"not 'other' — verify label order/training before shipping.")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -501,8 +529,12 @@ def main():
             export_tflite(model, class_names, args.output_dir,
                           quantize=args.quantize, backbone_name=args.backbone)
         except Exception as e:
-            print(f"\n⚠️ Export to TFLite failed: {e}")
+            # FATAL: a run that trains but produces no/broken .tflite must not
+            # look like success. The Keras checkpoints are still on disk to
+            # convert manually, but we exit non-zero so it can't pass silently.
+            print(f"\n❌ Export to TFLite FAILED: {e}")
             print("   Keras checkpoints saved in output dir — convert in Colab.")
+            raise
 
 
 if __name__ == "__main__":
