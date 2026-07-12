@@ -12,7 +12,7 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
   final CameraService cameraService;
   final TFLiteService tfliteService;
 
-  StreamSubscription? _cameraSubscription;
+  StreamSubscription<CameraFrame>? _cameraSubscription;
 
   CurrencyRepositoryImpl({
     required this.cameraService,
@@ -29,7 +29,8 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
   String? get modelErrorMessage => tfliteService.contractError;
 
   @override
-  bool get isCameraReady => cameraService.isInitialized;
+  bool get isCameraReady =>
+      cameraService.isInitialized && cameraService.isStreaming;
 
   @override
   CameraController? get cameraController => cameraService.cameraController;
@@ -41,8 +42,12 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
 
   @override
   Future<void> startCamera() async {
+    await _cameraSubscription?.cancel();
+    _cameraSubscription = null;
     await cameraService.initialize();
-    _cameraSubscription?.cancel();
+    if (!cameraService.isStreaming) {
+      return;
+    }
     _cameraSubscription = cameraService.frameStream.listen((frame) {
       tfliteService.processImage(
         frame.image,
@@ -54,7 +59,8 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
 
   @override
   Future<void> stopCamera() async {
-    _cameraSubscription?.cancel();
+    await _cameraSubscription?.cancel();
+    _cameraSubscription = null;
     await cameraService.setTorchEnabled(false);
     await cameraService.disposeCamera();
   }
@@ -76,20 +82,23 @@ class CurrencyRepositoryImpl implements CurrencyRepository {
   @override
   Stream<CurrencyEntity> getCurrencyStream() {
     return tfliteService.resultStream.map((result) {
-      final String normalized =
-          normalizeYemeniClassifierLabel(result.label);
+      final String normalized = normalizeYemeniClassifierLabel(result.label);
       return CurrencyModel.fromInference(
         label: normalized,
         displayName: arabicTtsForYemeniBill(normalized),
         confidence: result.confidence,
         topK: result.topK,
+        quality: result.quality,
+        brightness: result.brightness,
+        sharpness: result.sharpness,
       );
     });
   }
 
   @override
   void dispose() {
-    _cameraSubscription?.cancel();
+    unawaited(_cameraSubscription?.cancel());
+    _cameraSubscription = null;
     cameraService.dispose();
     tfliteService.dispose();
   }

@@ -62,8 +62,8 @@ phase machine (`idle`/`scanning`/`lowLight`/`success`), torch logic, and the
 app-lifecycle pause/resume that keeps the camera handle alive in the background.
 
 UI is just two pages: `SplashPage` (TTS welcome + camera-permission flow) and
-`ScannerPage` (full-screen gesture surface: tap = start/stop, long-press =
-screenshot to gallery). There is intentionally **no** runtime gesture to change
+`ScannerPage` (full-screen gesture surface: tap = start/stop). There is
+intentionally **no** runtime gesture to change
 the normalization mode — cycling it away from `raw` would break the baked
 `Rescaling` contract and mis-classify every bill.
 

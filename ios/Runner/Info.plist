@@ -8,12 +8,6 @@
 	<key>NSCameraUsageDescription</key>
 	<string>يحتاج بقش إلى الكاميرا للتعرف على فئات العملة الورقية اليمنية ومساعدة المستخدمين ذوي الإعاقة البصرية. The Bigash app needs camera access to recognize Yemeni banknotes and assist visually impaired users.</string>
 
-	<!-- Photo library write permission is needed by the `gal` plugin when -->
-	<!-- the user long-presses to save a debug screenshot. We never read -->
-	<!-- existing photos, so no NSPhotoLibraryUsageDescription. -->
-	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>لحفظ لقطة شاشة المسح في معرض الصور. To save scan screenshots to your photo gallery.</string>
-
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

@@ -9,11 +9,7 @@ void main() {
   testWidgets('Splash renders the app title', (WidgetTester tester) async {
     await tester.pumpWidget(
       const MaterialApp(
-        home: Scaffold(
-          body: Center(
-            child: Text('بقش\nBigash'),
-          ),
-        ),
+        home: Scaffold(body: Center(child: Text('بقش\nBigash'))),
       ),
     );
 

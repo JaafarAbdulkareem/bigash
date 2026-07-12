@@ -7,18 +7,25 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:bigash/domain/currency/frame_quality.dart';
 
 class TFLiteResult {
   final String label;
   final String displayName;
   final double confidence;
   final List<MapEntry<String, double>> topK;
+  final CaptureQuality quality;
+  final double brightness;
+  final double sharpness;
 
   const TFLiteResult({
     required this.label,
     required this.displayName,
     required this.confidence,
     this.topK = const <MapEntry<String, double>>[],
+    this.quality = CaptureQuality.usable,
+    this.brightness = 0,
+    this.sharpness = 0,
   });
 }
 
@@ -31,6 +38,10 @@ enum NormalizationMode { raw, signed, unsigned, imageNet }
 
 class TFLiteService {
   static const String modelAssetPath = 'assets/bigash_v18.tflite';
+  static const bool _diagnosticsEnabled = bool.fromEnvironment(
+    'BIGASH_DIAGNOSTICS',
+    defaultValue: !kReleaseMode,
+  );
 
   /// Minimum spacing between *emitted* results — a steady detection cadence for
   /// blind-user scanning. With [useTTA] on, each processed frame runs FOUR
@@ -53,8 +64,12 @@ class TFLiteService {
   bool _isProcessing = false;
   DateTime? _lastEmittedAt;
 
-  int _inputWidth = 224;
-  int _inputHeight = 224;
+  int _inputWidth = 0;
+  int _inputHeight = 0;
+  int _inputChannels = 0;
+  int _inputBatch = 0;
+  String _inputTypeName = '';
+  String _outputTypeName = '';
   bool _inputIsUint8 = false;
   double _inputScale = 1.0;
   int _inputZeroPoint = 0;
@@ -97,7 +112,9 @@ class TFLiteService {
     }
 
     try {
-      final String labelsContent = await rootBundle.loadString('assets/labels.txt');
+      final String labelsContent = await rootBundle.loadString(
+        'assets/labels.txt',
+      );
       _labels = labelsContent
           .split('\n')
           .map((String e) => e.trim())
@@ -127,6 +144,27 @@ class TFLiteService {
           'تعذّر تحميل ملف التسميات. أعد بناء التطبيق مع ملف labels المطابق للنموذج.';
       return;
     }
+    final bool supportedInputType =
+        _inputTypeName.contains('float32') || _inputTypeName.contains('uint8');
+    final bool supportedOutputType =
+        _outputTypeName.contains('float32') ||
+        _outputTypeName.contains('uint8');
+    if (_numClasses <= 0 ||
+        _inputWidth <= 0 ||
+        _inputHeight <= 0 ||
+        _inputBatch != 1 ||
+        _inputChannels != 3 ||
+        !supportedInputType ||
+        !supportedOutputType) {
+      _contractError =
+          'بنية النموذج غير مدعومة. أعد تصدير نموذج بصور RGB ومخارج متوافقة ثم أعد بناء التطبيق.';
+      debugPrint(
+        '[TFLite] INVALID TENSORS: input=$_inputBatch x '
+        '${_inputWidth}x$_inputHeight x $_inputChannels ($_inputTypeName), '
+        'classes=$_numClasses ($_outputTypeName)',
+      );
+      return;
+    }
     if (_numClasses > 0 && _numClasses != _labels.length) {
       _contractError =
           'النموذج وملف التسميات غير متطابقين. أعد بناء التطبيق بنموذج وتسميات من نفس التدريب.';
@@ -144,10 +182,13 @@ class TFLiteService {
       final inputTensor = interpreter.getInputTensor(0);
       final shape = inputTensor.shape; // [1, H, W, 3]
       if (shape.length == 4) {
+        _inputBatch = shape[0];
         _inputHeight = shape[1];
         _inputWidth = shape[2];
+        _inputChannels = shape[3];
       }
-      _inputIsUint8 = inputTensor.type.toString().toLowerCase().contains('uint8');
+      _inputTypeName = inputTensor.type.toString().toLowerCase();
+      _inputIsUint8 = _inputTypeName.contains('uint8');
       final inQp = inputTensor.params;
       _inputScale = inQp.scale == 0 ? 1.0 : inQp.scale;
       _inputZeroPoint = inQp.zeroPoint;
@@ -155,16 +196,21 @@ class TFLiteService {
       final outputTensor = interpreter.getOutputTensor(0);
       final outShape = outputTensor.shape;
       _numClasses = outShape.last;
-      _outputIsUint8 = outputTensor.type.toString().toLowerCase().contains('uint8');
+      _outputTypeName = outputTensor.type.toString().toLowerCase();
+      _outputIsUint8 = _outputTypeName.contains('uint8');
 
       final qp = outputTensor.params;
       _outputScale = qp.scale == 0 ? 1.0 : qp.scale;
       _outputZeroPoint = qp.zeroPoint;
 
-      debugPrint(
-        '[TFLite] input=$shape uint8=$_inputIsUint8 inScale=$_inputScale inZp=$_inputZeroPoint, '
-        'output=$outShape uint8=$_outputIsUint8 outScale=$_outputScale outZp=$_outputZeroPoint',
-      );
+      if (_diagnosticsEnabled) {
+        debugPrint(
+          '[TFLite] input=$shape uint8=$_inputIsUint8 '
+          'inScale=$_inputScale inZp=$_inputZeroPoint, output=$outShape '
+          'uint8=$_outputIsUint8 outScale=$_outputScale '
+          'outZp=$_outputZeroPoint',
+        );
+      }
     } catch (e) {
       debugPrint('[TFLite] could not read tensor shape: $e');
     }
@@ -224,6 +270,16 @@ class TFLiteService {
         height: _inputHeight,
       );
 
+      // Reject frames whose detail or exposure is too poor before they can
+      // contribute a dangerous denomination vote. This is especially important
+      // when a blind user holds the phone by hand and motion blur is likely.
+      final FrameQualityMetrics qualityMetrics = _measureFrameQuality(resized);
+      final CaptureQuality quality = assessFrameQuality(qualityMetrics);
+      if (quality != CaptureQuality.usable) {
+        _emitQualityResult(quality, qualityMetrics);
+        return;
+      }
+
       // 4) Build TTA variants. Rotations (not flips). The v18 training applied
       // orthogonal 90°/180°/270° rotation to only ~30% of TRAIN images and kept
       // VAL upright, so the upright view is the best-calibrated input and the
@@ -258,7 +314,9 @@ class TFLiteService {
         validVariants++;
       }
       if (validVariants == 0) {
-        debugPrint('[TFLite] all TTA variants produced bad outputs — dropping frame');
+        debugPrint(
+          '[TFLite] all TTA variants produced bad outputs — dropping frame',
+        );
         return;
       }
       for (int i = 0; i < _numClasses; i++) {
@@ -293,10 +351,13 @@ class TFLiteService {
       for (int i = 0; i < indices.length; i++) {
         topK.add(MapEntry(_labels[indices[i]].trim(), accumProbs[indices[i]]));
       }
-      debugPrint(
-        '[TFLite] ${normalization.name} TTA=${useTTA ? "x${variants.length}" : "off"} top='
-        '${topK.take(3).map((e) => "${e.key}=${e.value.toStringAsFixed(2)}").join(", ")}',
-      );
+      if (_diagnosticsEnabled) {
+        debugPrint(
+          '[TFLite] ${normalization.name} '
+          'TTA=${useTTA ? "x${variants.length}" : "off"} top='
+          '${topK.take(3).map((e) => "${e.key}=${e.value.toStringAsFixed(2)}").join(", ")}',
+        );
+      }
 
       if (!_streamController.isClosed) {
         _lastEmittedAt = DateTime.now();
@@ -322,15 +383,10 @@ class TFLiteService {
 
     List<double> probs;
     if (_outputIsUint8) {
-      final output = List.generate(
-        1,
-        (_) => List<int>.filled(_numClasses, 0),
-      );
+      final output = List.generate(1, (_) => List<int>.filled(_numClasses, 0));
       _interpreter!.run(input, output);
       probs = output[0]
-          .map<double>(
-            (int q) => (q - _outputZeroPoint) * _outputScale,
-          )
+          .map<double>((int q) => (q - _outputZeroPoint) * _outputScale)
           .toList();
     } else {
       final output = List.generate(
@@ -351,22 +407,18 @@ class TFLiteService {
     if (_inputIsUint8) {
       final Uint8List bytes = Uint8List(1 * h * w * 3);
       int i = 0;
-      final bool useSigned = normalization == NormalizationMode.signed;
       for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
           final img.Pixel p = src.getPixel(x, y);
-          if (useSigned) {
-            final double rn = (p.r - 127.5) / 127.5;
-            final double gn = (p.g - 127.5) / 127.5;
-            final double bn = (p.b - 127.5) / 127.5;
-            bytes[i++] = (rn / _inputScale + _inputZeroPoint).round().clamp(0, 255);
-            bytes[i++] = (gn / _inputScale + _inputZeroPoint).round().clamp(0, 255);
-            bytes[i++] = (bn / _inputScale + _inputZeroPoint).round().clamp(0, 255);
-          } else {
-            bytes[i++] = p.r.toInt();
-            bytes[i++] = p.g.toInt();
-            bytes[i++] = p.b.toInt();
-          }
+          bytes[i++] = _quantizeInput(
+            _normalizeChannel(p.r.toDouble(), channel: 0),
+          );
+          bytes[i++] = _quantizeInput(
+            _normalizeChannel(p.g.toDouble(), channel: 1),
+          );
+          bytes[i++] = _quantizeInput(
+            _normalizeChannel(p.b.toDouble(), channel: 2),
+          );
         }
       }
       return bytes.reshape(<int>[1, h, w, 3]);
@@ -419,6 +471,81 @@ class TFLiteService {
         break;
     }
     return bytes.reshape(<int>[1, h, w, 3]);
+  }
+
+  void _emitQualityResult(CaptureQuality quality, FrameQualityMetrics metrics) {
+    if (_streamController.isClosed) return;
+    _lastEmittedAt = DateTime.now();
+    _streamController.add(
+      TFLiteResult(
+        label: '',
+        displayName: '',
+        confidence: 0,
+        quality: quality,
+        brightness: metrics.meanLuma,
+        sharpness: metrics.meanGradient,
+      ),
+    );
+  }
+
+  FrameQualityMetrics _measureFrameQuality(img.Image image) {
+    const int step = 4;
+    double lumaTotal = 0;
+    double gradientTotal = 0;
+    int samples = 0;
+    int gradientSamples = 0;
+    int darkSamples = 0;
+    int brightSamples = 0;
+
+    double lumaAt(int x, int y) {
+      final img.Pixel p = image.getPixel(x, y);
+      return 0.299 * p.r + 0.587 * p.g + 0.114 * p.b;
+    }
+
+    for (int y = 0; y < image.height; y += step) {
+      for (int x = 0; x < image.width; x += step) {
+        final double luma = lumaAt(x, y);
+        lumaTotal += luma;
+        samples++;
+        if (luma < 25) darkSamples++;
+        if (luma > 245) brightSamples++;
+
+        if (x >= step) {
+          gradientTotal += (luma - lumaAt(x - step, y)).abs();
+          gradientSamples++;
+        }
+        if (y >= step) {
+          gradientTotal += (luma - lumaAt(x, y - step)).abs();
+          gradientSamples++;
+        }
+      }
+    }
+
+    return FrameQualityMetrics(
+      meanLuma: samples == 0 ? 0 : lumaTotal / samples,
+      meanGradient: gradientSamples == 0 ? 0 : gradientTotal / gradientSamples,
+      darkRatio: samples == 0 ? 1 : darkSamples / samples,
+      brightRatio: samples == 0 ? 1 : brightSamples / samples,
+    );
+  }
+
+  double _normalizeChannel(double value, {required int channel}) {
+    switch (normalization) {
+      case NormalizationMode.raw:
+        return value;
+      case NormalizationMode.signed:
+        return (value - 127.5) / 127.5;
+      case NormalizationMode.unsigned:
+        return value / 255.0;
+      case NormalizationMode.imageNet:
+        const List<double> means = <double>[0.485, 0.456, 0.406];
+        const List<double> stds = <double>[0.229, 0.224, 0.225];
+        return (value / 255.0 - means[channel]) / stds[channel];
+    }
+  }
+
+  int _quantizeInput(double value) {
+    return (value / _inputScale + _inputZeroPoint).round().clamp(0, 255);
   }
 
   /// Returns true if any entry is NaN or infinite. NaN slipping into the

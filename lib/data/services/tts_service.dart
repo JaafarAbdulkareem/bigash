@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:vibration/vibration.dart';
@@ -7,6 +9,14 @@ class TTSService {
   bool _initialized = false;
   bool _initFailed = false;
   bool _arabicVoiceAvailable = true;
+  Future<void>? _initializationFuture;
+  int _speechGeneration = 0;
+
+  /// Some Android TTS engines never deliver the completion callback requested
+  /// by `awaitSpeakCompletion(true)`. Without a deadline that leaves the
+  /// scanner's post-announcement haptics/state transition suspended forever.
+  static const Duration _speechTimeout = Duration(seconds: 15);
+  static const Duration _stopTimeout = Duration(seconds: 2);
 
   TTSService(this._flutterTts);
 
@@ -17,8 +27,23 @@ class TTSService {
   /// announcements may then be silent or mispronounced.
   bool get arabicVoiceAvailable => _arabicVoiceAvailable;
 
-  Future<void> initialize() async {
-    if (_initialized) return;
+  Future<void> initialize() {
+    if (_initialized) return Future<void>.value();
+    final Future<void>? running = _initializationFuture;
+    if (running != null) return running;
+
+    final Future<void> future = _initialize();
+    _initializationFuture = future;
+    return future.whenComplete(() {
+      if (identical(_initializationFuture, future)) {
+        _initializationFuture = null;
+      }
+    });
+  }
+
+  Future<void> _initialize() async {
+    // A later attempt can recover after a transient engine failure.
+    _initFailed = false;
     try {
       await _flutterTts.setLanguage('ar');
       // Natural pitch. Pitch-shifting down to fake a deeper voice badly
@@ -41,8 +66,10 @@ class TTSService {
         final dynamic arOk = await _flutterTts.isLanguageAvailable('ar');
         _arabicVoiceAvailable = arOk == true || arOk == 1;
         if (!_arabicVoiceAvailable) {
-          debugPrint('[TTS] no Arabic voice installed — announcements may be '
-              'silent. The device needs an Arabic TTS voice.');
+          debugPrint(
+            '[TTS] no Arabic voice installed — announcements may be '
+            'silent. The device needs an Arabic TTS voice.',
+          );
         }
       } catch (e) {
         debugPrint('[TTS] isLanguageAvailable check failed: $e');
@@ -89,25 +116,39 @@ class TTSService {
   /// Speaks [text]. If TTS isn't available, emits a long vibration as a
   /// fallback so a blind user at least knows something was announced.
   Future<void> speak(String text) async {
+    final int generation = ++_speechGeneration;
     if (!_initialized) {
       await initialize();
     }
+    if (generation != _speechGeneration) return;
     if (_initFailed) {
       await _fallbackVibration();
       return;
     }
     try {
-      await _flutterTts.stop();
-      await _flutterTts.speak(text);
+      await _flutterTts.stop().timeout(_stopTimeout);
+      if (generation != _speechGeneration) return;
+      await _flutterTts.speak(text).timeout(_speechTimeout);
+    } on TimeoutException catch (e) {
+      debugPrint('[TTS] timed out: $e');
+      if (generation != _speechGeneration) return;
+      try {
+        await _flutterTts.stop().timeout(_stopTimeout);
+      } catch (_) {}
+      await _fallbackVibration();
     } catch (e) {
       debugPrint('[TTS] speak failed: $e');
+      if (generation != _speechGeneration) return;
       // One retry — many devices fail the first call after backgrounding.
       try {
-        await _flutterTts.stop();
-        await _flutterTts.speak(text);
+        await _flutterTts.stop().timeout(_stopTimeout);
+        if (generation != _speechGeneration) return;
+        await _flutterTts.speak(text).timeout(_speechTimeout);
       } catch (e2) {
         debugPrint('[TTS] speak retry failed: $e2');
-        await _fallbackVibration();
+        if (generation == _speechGeneration) {
+          await _fallbackVibration();
+        }
       }
     }
   }
@@ -117,17 +158,16 @@ class TTSService {
       if (await Vibration.hasVibrator()) {
         // Distinct long-short-long pattern so the user knows TTS failed
         // (vs. the normal short pulses from the scanner).
-        await Vibration.vibrate(
-          pattern: <int>[0, 400, 150, 100, 150, 400],
-        );
+        await Vibration.vibrate(pattern: <int>[0, 400, 150, 100, 150, 400]);
       }
     } catch (_) {}
   }
 
   Future<void> stop() async {
+    _speechGeneration++;
     if (!_initialized || _initFailed) return;
     try {
-      await _flutterTts.stop();
+      await _flutterTts.stop().timeout(_stopTimeout);
     } catch (e) {
       debugPrint('[TTS] stop failed: $e');
     }

@@ -1,16 +1,73 @@
-# bigash
+# بقش (Bigash)
 
-A new Flutter project.
+تطبيق Flutter يعمل دون اتصال بالإنترنت لمساعدة المكفوفين وضعاف البصر على
+التعرّف على فئات العملة الورقية اليمنية. يلتقط التطبيق إطارات الكاميرا، يشغّل
+نموذج TFLite محليًا، ثم يؤكد النتيجة بالصوت والاهتزاز.
 
-## Getting Started
+نتائج آخر فحص أمني وتشغيلي موثقة في [FORENSIC_AUDIT.md](FORENSIC_AUDIT.md).
 
-This project is a starting point for a Flutter application.
+## التشغيل
 
-A few resources to get you started if this is your first Flutter project:
+المتطلبات الأساسية: Flutter 3.32 أو أحدث، Dart 3.8 أو أحدث، وAndroid SDK.
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+```bash
+flutter pub get
+flutter analyze
+flutter test
+flutter run
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+لبناء APK محلي:
+
+```bash
+flutter build apk --release
+```
+
+نسخة Release المحلية تستخدم مفتاح debug إذا لم يوجد `android/key.properties`.
+قبل النشر يجب ضبط مفتاح توقيع حقيقي وتغيير `com.example.bigash` إلى معرّف حزمة
+فريد تملكه.
+
+## الاستخدام
+
+- امنح التطبيق إذن الكاميرا عند أول تشغيل.
+- اضغط في أي مكان لبدء المسح أو إيقافه.
+- وجّه الكاميرا نحو الورقة النقدية وانتظر الإعلان الصوتي.
+- إذا كانت الصورة مهزوزة، اسند الهاتف أو ثبّت المرفقين وقرّب العملة ببطء؛
+  التطبيق يرفض الإطار غير الواضح بدل تخمين الفئة.
+
+الحد البرتقالي يعني أن المسح جارٍ، والأحمر يعني أن الإطار غير واضح ويحتاج إلى
+تغيير المسافة، والأخضر يعني نجاح التعرّف. الصوت والاهتزاز هما القناتان
+الأساسيتان للمستخدم ذي الإعاقة البصرية.
+
+## البنية
+
+- `lib/data`: الكاميرا، TFLite، تحويل الإطارات، والنطق الصوتي.
+- `lib/domain`: الكيانات، توحيد التسميات، وبوابات الثقة والتصويت.
+- `lib/presentation`: حالة المسح وشاشتا البداية والماسح.
+- `test`: اختبارات منطق القرار والتسميات واختبار واجهة بسيط.
+- `tools`: تدريب النموذج وتقييمه وتجهيز البيانات.
+
+## عقد النموذج
+
+الملفان التاليان يجب أن يأتيا من عملية التدريب نفسها:
+
+- `assets/bigash_v18.tflite`
+- `assets/labels.txt`
+
+ترتيب أسطر التسميات يجب أن يطابق ترتيب مخارج النموذج تمامًا. النموذج الحالي
+يتوقع صورًا مربعة بحجم 224×224 وقيم بكسل خام `[0,255]` لأن طبقة `Rescaling`
+مضمّنة داخله. تغيير التطبيع أو القص أو ترتيب التسميات دون إعادة تدريب متوافق قد
+ينتج إعلان فئة خاطئة، لذلك يرفض التطبيق التشغيل عند اكتشاف عدم تطابق عدد
+المخارج والتسميات.
+
+## التحقق قبل النشر
+
+```bash
+flutter analyze
+flutter test
+flutter build apk --release
+```
+
+ولأن دقة إعلان الفئة حساسة ماليًا، يجب أيضًا اختبار النسخة المبنية على جهاز
+حقيقي وبأوراق يمنية حقيقية، مع إضاءات وخلفيات ومسافات مختلفة، إضافة إلى عملات
+أجنبية للتأكد من رفضها كـ«عملة غير معروفة».

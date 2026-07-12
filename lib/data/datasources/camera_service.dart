@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' show Offset;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
@@ -38,6 +39,7 @@ class CameraService {
       _selectedCamera?.lensDirection == CameraLensDirection.front;
 
   bool get isInitialized => _cameraController?.value.isInitialized ?? false;
+  bool get isStreaming => _cameraController?.value.isStreamingImages ?? false;
 
   Future<void> initialize() async {
     if (_cameraController?.value.isInitialized == true) {
@@ -118,6 +120,19 @@ class CameraService {
     } catch (e) {
       debugPrint('[Camera] setExposureMode failed: $e');
     }
+    // The banknote is expected in the center crop consumed by the model. Ask
+    // autofocus/exposure to prioritize that exact area; unsupported devices
+    // simply keep their default continuous behavior.
+    try {
+      await _cameraController!.setFocusPoint(const Offset(0.5, 0.5));
+    } catch (e) {
+      debugPrint('[Camera] setFocusPoint failed: $e');
+    }
+    try {
+      await _cameraController!.setExposurePoint(const Offset(0.5, 0.5));
+    } catch (e) {
+      debugPrint('[Camera] setExposurePoint failed: $e');
+    }
 
     final int orientation = _selectedCamera!.sensorOrientation;
     final bool front =
@@ -150,9 +165,7 @@ class CameraService {
       return false;
     }
     try {
-      await controller.setFlashMode(
-        enabled ? FlashMode.torch : FlashMode.off,
-      );
+      await controller.setFlashMode(enabled ? FlashMode.torch : FlashMode.off);
       return true;
     } catch (_) {
       // Torch may be unavailable on some devices.

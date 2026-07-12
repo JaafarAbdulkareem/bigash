@@ -15,15 +15,11 @@ void init() {
   sl.registerLazySingleton<FlutterTts>(() => FlutterTts());
   sl.registerLazySingleton<TTSService>(() => TTSService(sl()));
 
-  sl.registerLazySingleton<CurrencyRepository>(() => CurrencyRepositoryImpl(
-    cameraService: sl(),
-    tfliteService: sl(),
-  ));
+  sl.registerLazySingleton<CurrencyRepository>(
+    () => CurrencyRepositoryImpl(cameraService: sl(), tfliteService: sl()),
+  );
 
   sl.registerFactory<DetectionCubit>(
-    () => DetectionCubit(
-      repository: sl(),
-      ttsService: sl(),
-    ),
+    () => DetectionCubit(repository: sl(), ttsService: sl()),
   );
 }

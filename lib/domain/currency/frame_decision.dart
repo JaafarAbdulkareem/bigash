@@ -24,8 +24,9 @@ List<MapEntry<String, double>> groupTopK(
 ) {
   final Map<String, double> sums = <String, double>{};
   for (final MapEntry<String, double> e in rawTopK) {
-    final String group =
-        denominationGroupForVoting(normalizeYemeniClassifierLabel(e.key));
+    final String group = denominationGroupForVoting(
+      normalizeYemeniClassifierLabel(e.key),
+    );
     sums[group] = (sums[group] ?? 0) + e.value;
   }
   final List<MapEntry<String, double>> out = sums.entries.toList()
@@ -146,7 +147,8 @@ FrameAssessment classifyFrame(
 
   // Not a confident Yemeni denomination. If `other` clearly leads, say so;
   // otherwise it is simply ambiguous and the user should reposition.
-  if (otherProb >= t.otherThreshold && (otherProb - topCurrency) >= t.voteMargin) {
+  if (otherProb >= t.otherThreshold &&
+      (otherProb - topCurrency) >= t.voteMargin) {
     return FrameAssessment(FrameVerdict.unknown, 'other', otherProb);
   }
 
@@ -170,7 +172,8 @@ class MajorityVoter {
   final int minMatches;
   final Duration maxAge;
 
-  final List<MapEntry<String, DateTime>> _votes = <MapEntry<String, DateTime>>[];
+  final List<MapEntry<String, DateTime>> _votes =
+      <MapEntry<String, DateTime>>[];
 
   int get length => _votes.length;
 

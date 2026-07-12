@@ -5,6 +5,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:vibration/vibration.dart';
 import 'package:bigash/data/services/tts_service.dart';
 import 'package:bigash/presentation/pages/scanner_page.dart';
+import 'package:bigash/presentation/widgets/splash_content.dart';
 
 class SplashPage extends StatefulWidget {
   final TTSService ttsService;
@@ -18,6 +19,7 @@ class SplashPage extends StatefulWidget {
 class _SplashPageState extends State<SplashPage>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   bool _waitingForPermission = false;
+
   /// Drives the entrance fade-in for the splash content. Partially-sighted
   /// users see "something appeared", blind users are unaffected. Duration
   /// is short on purpose — we don't want to delay the camera prompt.
@@ -29,12 +31,14 @@ class _SplashPageState extends State<SplashPage>
     parent: _fadeController,
     curve: Curves.easeOut,
   );
+
   /// True while a `Permission.camera.request()` is in flight. Without this
   /// guard a fast double-tap on "Retry" fires a second request before the
   /// first dialog dismisses, and the plugin throws:
   ///   PlatformException(PermissionHandler.PermissionManager,
   ///     A request for permissions is already running...)
   bool _requestingPermission = false;
+  bool _navigating = false;
   String _status = 'مرحبا بك في تطبيق بقش';
 
   @override
@@ -56,11 +60,18 @@ class _SplashPageState extends State<SplashPage>
 
   Future<void> _recheckPermissionOnResume() async {
     final PermissionStatus status = await Permission.camera.status;
-    if (status.isGranted && mounted) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const ScannerPage()),
-      );
+    if (status.isGranted) {
+      await _openScanner();
     }
+  }
+
+  Future<void> _openScanner() async {
+    if (!mounted || _navigating) return;
+    _navigating = true;
+    _waitingForPermission = false;
+    await Navigator.of(context).pushReplacement(
+      MaterialPageRoute<void>(builder: (_) => const ScannerPage()),
+    );
   }
 
   Future<void> _initAndRoute() async {
@@ -69,7 +80,8 @@ class _SplashPageState extends State<SplashPage>
     // init or the device has no Arabic voice, denomination announcements would
     // be silent/garbled — warn loudly (vibration is the reliable cue) instead
     // of silently promising readiness.
-    if (widget.ttsService.initFailed || !widget.ttsService.arabicVoiceAvailable) {
+    if (widget.ttsService.initFailed ||
+        !widget.ttsService.arabicVoiceAvailable) {
       await _warnTtsDegraded();
     } else {
       // The visible name is "بقش" but TTS engines mispronounce it (the leading
@@ -94,11 +106,7 @@ class _SplashPageState extends State<SplashPage>
 
     await Future<void>.delayed(const Duration(milliseconds: 800));
 
-    if (mounted) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const ScannerPage()),
-      );
-    }
+    await _openScanner();
   }
 
   /// Requests camera permission and returns whether it was granted.
@@ -139,7 +147,8 @@ class _SplashPageState extends State<SplashPage>
     }
     if (mounted) {
       setState(() {
-        _status = 'تنبيه: لا يتوفر صوت عربي للنطق على هذا الجهاز. '
+        _status =
+            'تنبيه: لا يتوفر صوت عربي للنطق على هذا الجهاز. '
             'ثبّت صوتا عربيا من إعدادات الجهاز لقراءة فئات العملة بوضوح.';
       });
     }
@@ -163,6 +172,7 @@ class _SplashPageState extends State<SplashPage>
   }
 
   Future<void> _onRetryTap() async {
+    if (_requestingPermission || _navigating) return;
     PermissionStatus status = await Permission.camera.status;
     if (status.isPermanentlyDenied) {
       await widget.ttsService.speak(
@@ -172,10 +182,8 @@ class _SplashPageState extends State<SplashPage>
       return;
     }
     final bool granted = await _ensureCameraPermission();
-    if (granted && mounted) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const ScannerPage()),
-      );
+    if (granted) {
+      await _openScanner();
     } else {
       await _alertNeedsPermission();
     }
@@ -191,105 +199,11 @@ class _SplashPageState extends State<SplashPage>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: GestureDetector(
-        onTap: _waitingForPermission ? _onRetryTap : null,
-        behavior: HitTestBehavior.opaque,
-        // Subtle radial gradient — keeps the black base (high contrast for
-        // low-vision users) while adding a touch of depth around the logo.
-        child: DecoratedBox(
-          decoration: const BoxDecoration(
-            gradient: RadialGradient(
-              center: Alignment(0, -0.2),
-              radius: 0.9,
-              colors: <Color>[
-                Color(0xFF1A1A2E),
-                Colors.black,
-              ],
-            ),
-          ),
-          child: Center(
-            child: Semantics(
-              label: _waitingForPermission
-                  ? 'إذن الكاميرا مطلوب. اضغط على الشاشة لإعادة المحاولة.'
-                  // Spoken by TalkBack/VoiceOver — spell as "بيقش" for the
-                  // same reason the TTS string does (see _initAndRoute).
-                  : 'شاشة البداية، جاري تحميل تطبيق بيقش',
-              button: _waitingForPermission,
-              child: FadeTransition(
-                opacity: _fadeIn,
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: <Widget>[
-                      // Wallet icon caps the logo — purely decorative for the
-                      // sighted; blind users get the spoken welcome instead.
-                      Container(
-                        padding: const EdgeInsets.all(18),
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Colors.yellow.withValues(alpha: 0.12),
-                          border: Border.all(
-                            color: Colors.yellow.withValues(alpha: 0.5),
-                            width: 2,
-                          ),
-                        ),
-                        child: const Icon(
-                          Icons.account_balance_wallet_outlined,
-                          color: Colors.yellow,
-                          size: 56,
-                        ),
-                      ),
-                      const SizedBox(height: 28),
-                      const Text(
-                        'بقش',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 64,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.yellow,
-                          height: 1.0,
-                          letterSpacing: 2,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        'Bigash',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.w500,
-                          color: Colors.yellow.withValues(alpha: 0.75),
-                          letterSpacing: 4,
-                        ),
-                      ),
-                      const SizedBox(height: 36),
-                      Text(
-                        _status,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          fontSize: 18,
-                          color: Colors.white,
-                          height: 1.4,
-                        ),
-                      ),
-                      if (_waitingForPermission) ...<Widget>[
-                        const SizedBox(height: 32),
-                        const Icon(Icons.touch_app,
-                            color: Colors.yellow, size: 64),
-                        const SizedBox(height: 8),
-                        const Text(
-                          'اضغط لإعادة المحاولة',
-                          style: TextStyle(color: Colors.yellow, fontSize: 16),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
+      body: SplashContent(
+        status: _status,
+        waitingForPermission: _waitingForPermission,
+        fadeAnimation: _fadeIn,
+        onRetry: _onRetryTap,
       ),
     );
   }

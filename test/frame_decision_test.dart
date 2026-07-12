@@ -7,29 +7,33 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:bigash/domain/currency/frame_decision.dart';
 
-List<MapEntry<String, double>> e(Map<String, double> m) =>
-    m.entries.toList();
+List<MapEntry<String, double>> e(Map<String, double> m) => m.entries.toList();
 
 void main() {
   group('groupTopK', () {
-    test('sums the new/old sub-variants of one denomination into the parent', () {
-      // A worn 100 bill splits its mass across its two designs.
-      final List<MapEntry<String, double>> grouped = groupTopK(<MapEntry<String, double>>[
-        const MapEntry<String, double>('y100_new', 0.31),
-        const MapEntry<String, double>('y100_old', 0.27),
-        const MapEntry<String, double>('other', 0.09),
-      ]);
-      expect(grouped.first.key, 'y100');
-      expect(grouped.first.value, closeTo(0.58, 1e-9));
-      expect(grouped[1].key, 'other');
-    });
+    test(
+      'sums the new/old sub-variants of one denomination into the parent',
+      () {
+        // A worn 100 bill splits its mass across its two designs.
+        final List<MapEntry<String, double>> grouped =
+            groupTopK(<MapEntry<String, double>>[
+              const MapEntry<String, double>('y100_new', 0.31),
+              const MapEntry<String, double>('y100_old', 0.27),
+              const MapEntry<String, double>('other', 0.09),
+            ]);
+        expect(grouped.first.key, 'y100');
+        expect(grouped.first.value, closeTo(0.58, 1e-9));
+        expect(grouped[1].key, 'other');
+      },
+    );
 
     test('strips index prefixes and is deterministic on ties', () {
-      final List<MapEntry<String, double>> grouped = groupTopK(<MapEntry<String, double>>[
-        const MapEntry<String, double>('4 y200_new', 0.20),
-        const MapEntry<String, double>('5 y200_old', 0.20),
-        const MapEntry<String, double>('7 y50', 0.20),
-      ]);
+      final List<MapEntry<String, double>> grouped =
+          groupTopK(<MapEntry<String, double>>[
+            const MapEntry<String, double>('4 y200_new', 0.20),
+            const MapEntry<String, double>('5 y200_old', 0.20),
+            const MapEntry<String, double>('7 y50', 0.20),
+          ]);
       // y200 (0.40) leads; y50 (0.20) second. Deterministic order.
       expect(grouped.first.key, 'y200');
       expect(grouped.first.value, closeTo(0.40, 1e-9));
@@ -93,17 +97,19 @@ void main() {
       // distribution carried through, otherProb=0.14 > otherCeiling(0.12) and
       // the note is correctly refused.
       final FrameAssessment a = classifyFrame(
-        groupTopK(e(<String, double>{
-          'y200_old': 0.32,
-          'y200_new': 0.28,
-          'y500': 0.15,
-          'other': 0.14, // rank 4 — dropped by any top-3 truncation
-          'y1000': 0.05,
-          'y250': 0.03,
-          'y50': 0.02,
-          'y100_new': 0.005,
-          'y100_old': 0.005,
-        })),
+        groupTopK(
+          e(<String, double>{
+            'y200_old': 0.32,
+            'y200_new': 0.28,
+            'y500': 0.15,
+            'other': 0.14, // rank 4 — dropped by any top-3 truncation
+            'y1000': 0.05,
+            'y250': 0.03,
+            'y50': 0.02,
+            'y100_new': 0.005,
+            'y100_old': 0.005,
+          }),
+        ),
         t,
       );
       expect(a.verdict, isNot(FrameVerdict.currency));
@@ -118,17 +124,19 @@ void main() {
       // 0.40 and reject a real bill as "uncertain". The full distribution sums
       // y100 to 0.54 and announces it.
       final FrameAssessment a = classifyFrame(
-        groupTopK(e(<String, double>{
-          'y100_new': 0.40,
-          'y500': 0.16,
-          'y250': 0.15,
-          'y100_old': 0.14, // rank 4 — dropped by any top-3 truncation
-          'other': 0.11,
-          'y1000': 0.02,
-          'y50': 0.01,
-          'y200_new': 0.005,
-          'y200_old': 0.005,
-        })),
+        groupTopK(
+          e(<String, double>{
+            'y100_new': 0.40,
+            'y500': 0.16,
+            'y250': 0.15,
+            'y100_old': 0.14, // rank 4 — dropped by any top-3 truncation
+            'other': 0.11,
+            'y1000': 0.02,
+            'y50': 0.01,
+            'y200_new': 0.005,
+            'y200_old': 0.005,
+          }),
+        ),
         t,
       );
       expect(a.verdict, FrameVerdict.currency);
@@ -161,8 +169,10 @@ void main() {
     });
 
     test('empty distribution is uncertain', () {
-      expect(classifyFrame(<MapEntry<String, double>>[], t).verdict,
-          FrameVerdict.uncertain);
+      expect(
+        classifyFrame(<MapEntry<String, double>>[], t).verdict,
+        FrameVerdict.uncertain,
+      );
     });
   });
 

@@ -2,9 +2,12 @@
 // turns raw classifier labels into canonical keys and Arabic speech.
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/services.dart';
 import 'package:bigash/domain/currency/yemeni_currency_label_mapper.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('normalizeYemeniClassifierLabel', () {
     test('strips a leading numeric index separated by a space', () {
       expect(normalizeYemeniClassifierLabel('6 y1000'), 'y1000');
@@ -31,8 +34,14 @@ void main() {
     });
 
     test('treats real denominations as not ignored', () {
-      for (final String label in <String>['y50', 'y100', 'y200', 'y250',
-        'y500', 'y1000']) {
+      for (final String label in <String>[
+        'y50',
+        'y100',
+        'y200',
+        'y250',
+        'y500',
+        'y1000',
+      ]) {
         expect(isIgnoredYemeniCurrencyLabel(label), isFalse, reason: label);
       }
     });
@@ -57,22 +66,31 @@ void main() {
       expect(arabicTtsForYemeniBill('y200_old'), 'مائتا ريال يمني');
     });
 
-    test('every label shipped in assets/labels.txt maps to non-empty Arabic '
-        'speech (no raw English token spoken to a blind user)', () {
-      // Safety contract: the 9 classes the model can actually emit must each
-      // resolve to a real Arabic phrase, never fall through to a raw token.
-      const List<String> shipped = <String>[
-        'other', 'y1000', 'y100_new', 'y100_old', 'y200_new', 'y200_old',
-        'y250', 'y50', 'y500',
-      ];
-      for (final String label in shipped) {
-        if (isIgnoredYemeniCurrencyLabel(label)) continue;
-        final String spoken = arabicTtsForYemeniBill(label);
-        expect(spoken, isNot(label),
-            reason: '$label fell through to a verbatim token');
-        expect(spoken.contains('ريال'), isTrue, reason: label);
-      }
-    });
+    test(
+      'every label actually shipped in assets/labels.txt maps to non-empty '
+      'Arabic speech (no raw English token spoken to a blind user)',
+      () async {
+        // Safety contract: the 9 classes the model can actually emit must each
+        // resolve to a real Arabic phrase, never fall through to a raw token.
+        final String content = await rootBundle.loadString('assets/labels.txt');
+        final List<String> shipped = content
+            .split('\n')
+            .map(normalizeYemeniClassifierLabel)
+            .where((String label) => label.isNotEmpty)
+            .toList();
+        expect(shipped, hasLength(9));
+        for (final String label in shipped) {
+          if (isIgnoredYemeniCurrencyLabel(label)) continue;
+          final String spoken = arabicTtsForYemeniBill(label);
+          expect(
+            spoken,
+            isNot(label),
+            reason: '$label fell through to a verbatim token',
+          );
+          expect(spoken.contains('ريال'), isTrue, reason: label);
+        }
+      },
+    );
 
     test('falls back to the raw label for unknown input', () {
       expect(arabicTtsForYemeniBill('xyz'), 'xyz');
@@ -87,12 +105,15 @@ void main() {
   });
 
   group('denominationGroupForVoting', () {
-    test('collapses 100 and 200 design variants to the parent denomination', () {
-      expect(denominationGroupForVoting('y100_new'), 'y100');
-      expect(denominationGroupForVoting('y100_old'), 'y100');
-      expect(denominationGroupForVoting('y200_new'), 'y200');
-      expect(denominationGroupForVoting('y200_old'), 'y200');
-    });
+    test(
+      'collapses 100 and 200 design variants to the parent denomination',
+      () {
+        expect(denominationGroupForVoting('y100_new'), 'y100');
+        expect(denominationGroupForVoting('y100_old'), 'y100');
+        expect(denominationGroupForVoting('y200_new'), 'y200');
+        expect(denominationGroupForVoting('y200_old'), 'y200');
+      },
+    );
 
     test('passes single-design denominations through unchanged', () {
       for (final String label in <String>['y50', 'y250', 'y500', 'y1000']) {
