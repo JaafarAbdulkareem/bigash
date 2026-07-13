@@ -99,6 +99,10 @@ The model and the Dart preprocessing must agree exactly, or the app
 - `labels.txt` entries are tolerated as `"<index> <label>"` or just `"<label>"`;
   `normalizeYemeniClassifierLabel` strips the leading index. Any label not in
   `arabicTtsForYemeniBill` falls through to being spoken verbatim.
+- The reviewed model SHA-256 and canonical label order are pinned in
+  `lib/domain/currency/model_asset_contract.dart`. After evaluating and adopting
+  a retrained model, update its digest in the same change; an unreviewed asset
+  deliberately fails closed at startup.
 
 Camera-frame decoding in `TFLiteService` is platform-specific: YUV420 on
 Android, BGRA8888 on iOS.

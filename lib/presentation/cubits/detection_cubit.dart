@@ -121,6 +121,7 @@ class DetectionCubit extends Cubit<DetectionState> {
   Future<void> _torchTransition = Future<void>.value();
   bool _pausedForBackground = false;
   bool _appInBackground = false;
+  bool _announcementInProgress = false;
 
   /// Guards start()/stop() against re-entry — a rapid double-tap could
   /// otherwise run two camera start/stop cycles at once and end up using a
@@ -204,6 +205,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     _pausedForBackground = false;
     _runId++;
     _cooldownUntil = null;
+    _announcementInProgress = false;
     _lastVoteAt = null;
     _lastOtherAnnounceAt = null;
     _cooldownTimer?.cancel();
@@ -429,6 +431,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     if (!state.isActive ||
         _appInBackground ||
         _pausedForBackground ||
+        _announcementInProgress ||
         _inCooldown) {
       return;
     }
@@ -487,6 +490,7 @@ class DetectionCubit extends Cubit<DetectionState> {
           if (tellUser) {
             _lastOtherAnnounceAt = now;
             _cooldownUntil = now.add(_speechCooldown);
+            _announcementInProgress = true;
             _stopPulsingVibration();
             _confirmVibrate(recognized: false);
             emit(
@@ -578,6 +582,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     final String spoken = recognized ? mapped : 'العملة غير معروفة';
     _voter.clear();
     _cooldownUntil = now.add(_speechCooldown);
+    _announcementInProgress = true;
     _stopPulsingVibration();
     _confirmVibrate(recognized: recognized);
     unawaited(_setTorch(false));
@@ -606,6 +611,8 @@ class DetectionCubit extends Cubit<DetectionState> {
     if (isClosed || runId != _runId) {
       return;
     }
+    _announcementInProgress = false;
+    _cooldownUntil = DateTime.now().add(_speechCooldown);
     _cooldownTimer?.cancel();
     _cooldownTimer = Timer(_speechCooldown, () {
       if (isClosed || runId != _runId) {
@@ -647,6 +654,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     _cooldownTimer?.cancel();
     _cooldownTimer = null;
     _cooldownUntil = null;
+    _announcementInProgress = false;
     _stopPulsingVibration();
     _stopPipelineWatchdog();
     unawaited(WakelockPlus.disable());
@@ -705,6 +713,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     }
     _runId++;
     _pausedForBackground = false;
+    _announcementInProgress = false;
     _stopPulsingVibration();
     _stopPipelineWatchdog();
     unawaited(WakelockPlus.disable());
@@ -767,6 +776,7 @@ class DetectionCubit extends Cubit<DetectionState> {
   Future<void> close() async {
     _runId++;
     _pausedForBackground = false;
+    _announcementInProgress = false;
     _stopPulsingVibration();
     _stopPipelineWatchdog();
     unawaited(WakelockPlus.disable());

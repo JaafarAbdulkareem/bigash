@@ -3,11 +3,13 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:bigash/domain/currency/frame_quality.dart';
+import 'package:bigash/domain/currency/model_asset_contract.dart';
 
 class TFLiteResult {
   final String label;
@@ -83,6 +85,7 @@ class TFLiteService {
   /// load). A spoken-ready Arabic message — surfaced to the blind user instead
   /// of silently mis-announcing every bill.
   String? _contractError;
+  String? _assetIntegrityError;
 
   final StreamController<TFLiteResult> _streamController =
       StreamController<TFLiteResult>.broadcast();
@@ -100,7 +103,9 @@ class TFLiteService {
       _interpreter != null && _labels.isNotEmpty && _contractError == null;
 
   Future<void> initialize() async {
-    if (_interpreter == null) {
+    await _verifyBundledAssets();
+
+    if (_assetIntegrityError == null && _interpreter == null) {
       try {
         _interpreter = await Interpreter.fromAsset(modelAssetPath);
         _readTensorShapes();
@@ -111,6 +116,11 @@ class TFLiteService {
       }
     }
 
+    _validateContract();
+  }
+
+  Future<void> _verifyBundledAssets() async {
+    _assetIntegrityError = null;
     try {
       final String labelsContent = await rootBundle.loadString(
         'assets/labels.txt',
@@ -119,13 +129,33 @@ class TFLiteService {
           .split('\n')
           .map((String e) => e.trim())
           .where((String e) => e.isNotEmpty)
-          .toList();
-    } catch (e) {
-      debugPrint('Labels load failed: $e');
-      _labels = <String>[];
-    }
+          .toList(growable: false);
+      if (!labelsMatchExpectedBigashOrder(_labels)) {
+        _assetIntegrityError =
+            'ترتيب تسميات النموذج غير معتمد. أعد بناء التطبيق بالنموذج والتسميات المراجعة.';
+        return;
+      }
 
-    _validateContract();
+      final ByteData modelData = await rootBundle.load(modelAssetPath);
+      final Uint8List modelBytes = modelData.buffer.asUint8List(
+        modelData.offsetInBytes,
+        modelData.lengthInBytes,
+      );
+      final String actualDigest = sha256.convert(modelBytes).toString();
+      if (actualDigest != expectedBigashModelSha256) {
+        _assetIntegrityError =
+            'ملف نموذج التعرف غير معتمد أو تالف. أعد تثبيت نسخة رسمية من التطبيق.';
+        debugPrint(
+          '[TFLite] MODEL DIGEST MISMATCH: expected='
+          '$expectedBigashModelSha256 actual=$actualDigest',
+        );
+      }
+    } catch (e) {
+      _labels = <String>[];
+      _assetIntegrityError =
+          'تعذّر التحقق من ملفات نموذج التعرف. أعد تثبيت التطبيق.';
+      debugPrint('[TFLite] asset integrity check failed: $e');
+    }
   }
 
   /// Verifies the bundled model and labels agree. A mismatch (e.g. a retrain
@@ -135,7 +165,8 @@ class TFLiteService {
   /// failure for this app. We fail LOUD: [isModelReady] goes false and
   /// [contractError] carries a spoken Arabic explanation.
   void _validateContract() {
-    _contractError = null;
+    _contractError = _assetIntegrityError;
+    if (_contractError != null) return;
     if (_interpreter == null) {
       return; // "no model" is handled separately (generic message).
     }
