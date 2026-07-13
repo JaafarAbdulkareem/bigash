@@ -11,8 +11,18 @@
          review flag. enableAudio is false, so RECORD_AUDIO is not needed. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" tools:node="remove" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove" />
+    <!-- camera_android_camerax still contributes these legacy permissions.
+         Keep explicit merger removals; the app neither reads nor writes user
+         media. ScopedStorage is ignored here because these declarations remove
+         permissions instead of requesting deprecated storage access. -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        tools:node="remove"
+        tools:ignore="ScopedStorage" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        tools:node="remove"
+        tools:ignore="ScopedStorage" />
 
     <!-- Declare that this app actually needs a camera, so the Play Store
          filters out devices without one. `required="true"` is the default;
@@ -26,6 +36,7 @@
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"><!-- No user data to back up; disabling avoids leaking any cached state off-device. -->
         <activity
             android:name=".MainActivity"

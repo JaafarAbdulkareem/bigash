@@ -34,7 +34,11 @@ class SplashContent extends StatelessWidget {
             builder: (BuildContext context, BoxConstraints constraints) {
               return SingleChildScrollView(
                 child: ConstrainedBox(
-                  constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                  constraints: BoxConstraints(
+                    minWidth: constraints.maxWidth,
+                    maxWidth: constraints.maxWidth,
+                    minHeight: constraints.maxHeight,
+                  ),
                   child: Semantics(
                     container: true,
                     excludeSemantics: true,

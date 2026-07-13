@@ -15,9 +15,15 @@ class ScannerSurface extends StatelessWidget {
     final bool hasPreview = _canShowCameraPreview(controller, state.isActive);
 
     return Semantics(
+      key: const Key('scanner_semantics_surface'),
       container: true,
       excludeSemantics: true,
       button: true,
+      // Denomination speech normally comes from TTS. Mark only the final
+      // result as a live region as a second, independent channel: TalkBack can
+      // announce the changed label if the Arabic TTS engine is missing or
+      // fails at runtime, without narrating every intermediate scan update.
+      liveRegion: state.phase == CurrencyDetectionPhase.success,
       label: scannerSemanticsLabel(state),
       child: GestureDetector(
         key: const Key('scanner_action_surface'),

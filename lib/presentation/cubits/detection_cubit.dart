@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:bigash/data/services/tts_service.dart';
 import 'package:bigash/domain/currency/frame_decision.dart';
 import 'package:bigash/domain/currency/frame_quality.dart';
+import 'package:bigash/domain/currency/reposition_guidance.dart';
 import 'package:bigash/domain/currency/yemeni_currency_label_mapper.dart';
 import 'package:bigash/domain/entities/currency_entity.dart';
 import 'package:bigash/domain/repositories/currency_repository.dart';
@@ -104,6 +105,8 @@ class DetectionCubit extends Cubit<DetectionState> {
   /// (strict majority of a pruned window + deterministic tie-break) lives in
   /// the pure [MajorityVoter] so it can be unit-tested without plugins.
   final MajorityVoter _voter = MajorityVoter();
+  final RepositionGuidancePolicy _repositionGuidance =
+      RepositionGuidancePolicy();
 
   /// Per-frame confidence / margin / OOD gates. Pure logic in [classifyFrame];
   /// see frame_decision.dart for what each threshold guards (including the
@@ -143,12 +146,15 @@ class DetectionCubit extends Cubit<DetectionState> {
   /// while the app is actively detecting.
   DateTime? _lastVoteAt;
 
-  /// When "العملة غير معروفة" was last announced — throttles it so the app
+  /// When "ليست عملة يمنية" was last announced — throttles it so the app
   /// states it once rather than nagging.
   DateTime? _lastOtherAnnounceAt;
   DateTime? _lastInferenceResultAt;
 
   static const Duration _speechCooldown = Duration(seconds: 3);
+  static const String _notYemeniCurrencyMessage = 'ليست عملة يمنية';
+  static const String _cannotReadMessage =
+      'تعذّر قراءة العملة، وقد لا تكون عملة يمنية.';
 
   bool get _inCooldown =>
       _cooldownUntil != null && DateTime.now().isBefore(_cooldownUntil!);
@@ -202,6 +208,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     }
 
     _voter.clear();
+    _repositionGuidance.reset();
     _pausedForBackground = false;
     _runId++;
     _cooldownUntil = null;
@@ -333,7 +340,7 @@ class DetectionCubit extends Cubit<DetectionState> {
 
   /// Pulse only after a frame has finished inference. The previous independent
   /// 90ms/650ms timer physically shook the camera while it was exposing the
-  /// next frame. A short post-result pulse ends before the 250ms inference
+  /// next frame. A short post-result pulse ends before the 500ms inference
   /// throttle accepts another frame, preserving tactile feedback without
   /// manufacturing motion blur ourselves.
   void _maybePulseAfterProcessedFrame(DateTime now) {
@@ -405,14 +412,27 @@ class DetectionCubit extends Cubit<DetectionState> {
 
   /// Speaks a reposition hint, throttled to once every 12 seconds so it
   /// guides the user calmly instead of repeating annoyingly.
-  void _maybeSpeakHint(String hint) {
+  void _maybeSpeakHint(String hint, {bool repositionHint = false}) {
     final DateTime now = DateTime.now();
     if (_lastHintAt != null &&
         now.difference(_lastHintAt!) < const Duration(seconds: 12)) {
       return;
     }
+    String spoken = hint;
+    if (repositionHint) {
+      switch (_repositionGuidance.next()) {
+        case RepositionGuidanceDecision.repeatHint:
+          break;
+        case RepositionGuidanceDecision.announceFailure:
+          spoken = _cannotReadMessage;
+          emit(state.copyWith(statusText: spoken));
+          break;
+        case RepositionGuidanceDecision.silent:
+          return;
+      }
+    }
     _lastHintAt = now;
-    unawaited(_ttsService.speak(hint));
+    unawaited(_ttsService.speak(spoken));
   }
 
   String _buildDebugText(CurrencyEntity entity) {
@@ -458,6 +478,7 @@ class DetectionCubit extends Cubit<DetectionState> {
 
     switch (assessment.verdict) {
       case FrameVerdict.currency:
+        _repositionGuidance.reset();
         unawaited(_setTorch(false));
         _lastVoteAt = now;
         _voter.add(assessment.key, now);
@@ -496,11 +517,11 @@ class DetectionCubit extends Cubit<DetectionState> {
             emit(
               state.copyWith(
                 phase: CurrencyDetectionPhase.success,
-                statusText: 'العملة غير معروفة',
+                statusText: _notYemeniCurrencyMessage,
                 debugText: debugText,
               ),
             );
-            unawaited(_finishSuccessAnnouncement('العملة غير معروفة'));
+            unawaited(_finishSuccessAnnouncement(_notYemeniCurrencyMessage));
             return;
           }
         }
@@ -532,7 +553,7 @@ class DetectionCubit extends Cubit<DetectionState> {
           ),
         );
         if (!_detectingRecently()) {
-          _maybeSpeakHint(hint);
+          _maybeSpeakHint(hint, repositionHint: true);
         }
         _maybePulseAfterProcessedFrame(now);
         return;
@@ -568,7 +589,12 @@ class DetectionCubit extends Cubit<DetectionState> {
             : '',
       ),
     );
-    if (!_detectingRecently()) _maybeSpeakHint(hint);
+    if (!_detectingRecently()) {
+      _maybeSpeakHint(
+        hint,
+        repositionHint: entity.quality == CaptureQuality.blurry,
+      );
+    }
     _maybePulseAfterProcessedFrame(now);
   }
 
@@ -579,8 +605,9 @@ class DetectionCubit extends Cubit<DetectionState> {
   void _announceCurrency(String groupKey, String debugText, DateTime now) {
     final String mapped = arabicTtsForYemeniBill(groupKey);
     final bool recognized = mapped != groupKey;
-    final String spoken = recognized ? mapped : 'العملة غير معروفة';
+    final String spoken = recognized ? mapped : _notYemeniCurrencyMessage;
     _voter.clear();
+    _repositionGuidance.reset();
     _cooldownUntil = now.add(_speechCooldown);
     _announcementInProgress = true;
     _stopPulsingVibration();
@@ -677,6 +704,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     // meaningful — what the user was scanning might be totally different
     // now. Reset so we don't false-trigger on resume.
     _voter.clear();
+    _repositionGuidance.reset();
     final bool resumed = await _repository.resumeCamera();
     if (!resumed) {
       // The capture session did not come back (common on iOS after a long
@@ -723,6 +751,7 @@ class DetectionCubit extends Cubit<DetectionState> {
     await _currencySubscription?.cancel();
     _currencySubscription = null;
     _voter.clear();
+    _repositionGuidance.reset();
     await _setTorch(false);
 
     // Drop [CameraPreview] before disposing so buildPreview() never runs on a dead controller.

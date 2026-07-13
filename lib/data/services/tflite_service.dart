@@ -45,11 +45,15 @@ class TFLiteService {
     defaultValue: !kReleaseMode,
   );
 
-  /// Minimum spacing between *emitted* results — a steady detection cadence for
-  /// blind-user scanning. With [useTTA] on, each processed frame runs FOUR
-  /// inferences, so the real cadence is max(250 ms, 4× inference time); this is
-  /// only the floor that throttles emissions, not a promise of one pass/250 ms.
-  static const Duration _minFrameInterval = Duration(milliseconds: 250);
+  /// Minimum spacing between *emitted* results. Field measurement on a
+  /// 4 GB Xiaomi M2004J19C showed 77–117% CPU while scanning at the old 250 ms
+  /// cadence, even on rejected frames, because full-frame YUV conversion runs
+  /// before the quality gate. Two samples per second still confirms a result
+  /// with three votes in about 1.5 seconds, while materially reducing heat,
+  /// battery drain, and the chance that thermal throttling stalls the camera.
+  /// With [useTTA] on, usable frames also run FOUR inferences, so the real
+  /// cadence is max(500 ms, 4× inference time).
+  static const Duration _minFrameInterval = Duration(milliseconds: 500);
 
   /// The bigash model has its own Rescaling layer baked in, so it expects
   /// raw [0, 255] float32 pixel values — no Flutter-side normalization.

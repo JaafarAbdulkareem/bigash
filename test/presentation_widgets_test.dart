@@ -26,6 +26,14 @@ void main() {
     expect(find.byKey(const Key('splash_status')), findsOneWidget);
     expect(find.text('اضغط لإعادة المحاولة'), findsOneWidget);
     expect(tester.takeException(), isNull);
+    expect(
+      tester.getCenter(find.text('بقش')).dx,
+      closeTo(
+        tester.getSize(find.byKey(const Key('splash_action_surface'))).width /
+            2,
+        0.5,
+      ),
+    );
 
     await tester.tap(find.byKey(const Key('splash_action_surface')));
     expect(retries, 1);
@@ -55,6 +63,13 @@ void main() {
     expect(find.text('خمسمائة ريال يمني'), findsOneWidget);
     expect(scannerPhaseColor(state), const Color(0xFF43A047));
     expect(scannerSemanticsLabel(state), contains('خمسمائة ريال يمني'));
+    expect(
+      tester
+          .widget<Semantics>(find.byKey(const Key('scanner_semantics_surface')))
+          .properties
+          .liveRegion,
+      isTrue,
+    );
 
     await tester.tap(find.byKey(const Key('scanner_action_surface')));
     expect(taps, 1);
@@ -75,5 +90,12 @@ void main() {
     expect(find.byKey(const Key('scanner_debug_overlay')), findsNothing);
     expect(find.byKey(const Key('scanner_status_overlay')), findsOneWidget);
     expect(scannerPhaseColor(state), Colors.transparent);
+    expect(
+      tester
+          .widget<Semantics>(find.byKey(const Key('scanner_semantics_surface')))
+          .properties
+          .liveRegion,
+      isFalse,
+    );
   });
 }

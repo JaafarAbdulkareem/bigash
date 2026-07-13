@@ -125,6 +125,11 @@ class _SplashPageState extends State<SplashPage>
     }
     _requestingPermission = true;
     try {
+      await widget.ttsService.speak(
+        'ستظهر الآن نافذة إذن الكاميرا. استخدم قارئ الشاشة، ثم اختر أثناء استخدام التطبيق، '
+        'أو هذه المرة فقط. كلا الخيارين يسمحان بقراءة العملة.',
+      );
+      if (!mounted) return false;
       status = await Permission.camera.request();
     } on PlatformException {
       // Shouldn't happen now that we guard above, but if the OS races us
